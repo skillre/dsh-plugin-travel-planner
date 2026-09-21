@@ -1,0 +1,109 @@
+{
+  "name": "@skillre/dsh-plugin-travel-planner",
+  "version": "0.11.3",
+  "description": "A DSH-native AI travel planning workspace with AMap-powered places, routes, and itinerary views",
+  "type": "module",
+  "license": "MIT",
+  "author": "skillre",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "packageManager": "npm@11.12.1",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./web": {
+      "types": "./lib/host/web-api.d.ts",
+      "default": "./lib/host/web-api.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./compatibility.json": "./compatibility.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "compatibility.json",
+    "README.md",
+    "README.en.md",
+    "UNINSTALL.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skillre/dsh-plugin-travel-planner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/skillre/dsh-plugin-travel-planner/issues"
+  },
+  "homepage": "https://github.com/skillre/dsh-plugin-travel-planner#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "cordis",
+    "travel-planner",
+    "amap"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc -p tsconfig.build.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "build:host": "tsc -p tsconfig.build.json",
+    "build:client": "tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "test": "npm run build:client && vitest run",
+    "pack:check": "npm run build && publint && npm pack --dry-run --json --ignore-scripts",
+    "check": "npm run typecheck && npm test && npm run pack:check",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release:prepare": "node scripts/prepare-release.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "schemastery": "^3.18.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-client-ui-sidebar-right": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-subprocess": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-util-values": "^0.1.5-rc.2",
+    "react": "^18.2.0"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^3.0.2",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-client-ui-sidebar-right": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-subprocess": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-util-values": "^0.1.5-rc.2",
+    "@types/node": "^24.13.3",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "publint": "^0.3.24",
+    "react": "^18.2.0",
+    "react-dom": "^18.3.1",
+    "typescript": "5.9.3",
+    "vitest": "^4.1.8"
+  }
+}

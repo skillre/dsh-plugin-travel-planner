@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "verbatimModuleSyntax": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "rootDir": "src",
+    "outDir": ".client-build",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/client/**/*.ts", "src/shared/**/*.ts"],
+  "exclude": []
+}

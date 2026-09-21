@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "package": "@skillre/dsh-plugin-travel-planner",
+  "verified": [
+    {
+      "dsh": "0.1.5-rc.2",
+      "verifiedAt": "2026-09-15",
+      "result": "passed",
+      "checks": [
+        "dump-config",
+        "bounded-startup"
+      ],
+      "notes": "Isolated DSH_HOME profile created from the shipped web template; the tarball was installed with `dsh plugin --profile travel-test add <tgz>`; two rows composed (skillre-travel-planner, skillre-travel-planner-web) and activated; the browser API answered /health and /state over the live server, the boot configuration was injected into the index, and the client bundle appeared in the composed boot graph and the /plugins combo. A human browser pass over the sidebar tab in a real session is still required before release, so the `browser` check is deliberately absent."
+    },
+    {
+      "dsh": "0.1.6-alpha.1",
+      "verifiedAt": "2026-09-15",
+      "result": "passed",
+      "checks": [
+        "dump-config",
+        "bounded-startup",
+        "browser"
+      ],
+      "notes": "Upgraded line. The right-Sidebar occupant is `active: true` in the live Slot ledger, which is the framework's own signal that the body renders without abdicating (the 0.1.1 failure). The inline AMap map was verified separately: the Web (JS API) key loads from a loopback page origin and renders tiles and a marker (docs/sidebar-v2-design.md 7.1). Isolated-profile `dump-config` and a bounded startup carried the two rows; the 0.1.6 line's guide seat adds `sidebar.right.tab.guide.entry`, which this package does not yet use. For 0.5.0 the timeline and the re-order flow were additionally exercised by a scripted browser run (`.verify/interactive-panel.mjs`) that mounts the shipped bundle with client-side React and drives real pointer events: the drop lands in the intended slot, the preview is held across the Host round-trip, and no preview state survives. The human pass over how the drag feels is still outstanding. For 0.7.0 the container-free photo path was measured against the real account: with an AMap Web-service key the plugin filled 10 of the 11 photo-less places of a live trip over HTTPS (POI id lookups first, keyword search second, calls paced for the key QPS cap), with no CLI invocation and therefore no AMap window."
+    }
+  ]
+}

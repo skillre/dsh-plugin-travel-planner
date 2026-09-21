@@ -1,0 +1,252 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  select:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js without shared package cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.13.0
+          package-manager-cache: false
+
+      - name: Pin npm release line
+        run: npm install --global npm@11.12.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Select release mode
+        id: mode
+        uses: changesets/action/select-mode@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+
+  version:
+    needs: select
+    if: ${{ needs.select.outputs.mode == 'version' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js without shared package cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.13.0
+          package-manager-cache: false
+
+      - name: Pin npm release line
+        run: npm install --global npm@11.12.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify before versioning
+        run: npm run check
+
+      - name: Create or update version PR
+        uses: changesets/action/version@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          script: npm run version
+          pr-title: 'chore: version package'
+          commit-message: 'chore: version package'
+
+  build-package:
+    needs: select
+    if: ${{ needs.select.outputs.mode == 'publish' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js without shared package cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.13.0
+          package-manager-cache: false
+
+      - name: Pin npm release line
+        run: npm install --global npm@11.12.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify publication candidate
+        run: npm run check
+
+      - name: Prepare immutable publication artifact
+        run: npm run release:prepare
+
+      - name: Upload publication artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-publication
+          path: release-artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [select, build-package]
+    if: ${{ needs.select.outputs.mode == 'publish' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' }}
+    runs-on: ubuntu-24.04
+    environment: npm-publish
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Set up Node.js for npm OIDC without package cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.13.0
+          package-manager-cache: false
+
+      - name: Require an OIDC-capable npm 11 release
+        run: |
+          node -e "const [a,b,c]=process.argv[1].split('.').map(Number); if(a!==11 || b<5 || (b===5 && c<1)) process.exit(1)" "$(npm --version)"
+
+      - name: Download immutable publication artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-publication
+          path: release-artifact
+
+      - name: Verify artifact identity and checksum
+        id: artifact
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          import { basename, join } from 'node:path'
+          const directory = 'release-artifact'
+          const metadata = JSON.parse(readFileSync(join(directory, 'release.json'), 'utf8'))
+          if (!/^@[a-z0-9-]+\/[a-z0-9-]+$/.test(metadata.package)) throw new Error('Unsafe package name')
+          if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(metadata.version)) {
+            throw new Error('Unsafe package version')
+          }
+          if (metadata.tag !== `v${metadata.version}`) throw new Error('Release tag and version differ')
+          if (!/^[-a-z0-9_.]+\.tgz$/.test(metadata.tarball) || basename(metadata.tarball) !== metadata.tarball) {
+            throw new Error('Unsafe tarball name')
+          }
+          const tarball = join(directory, metadata.tarball)
+          const bytes = readFileSync(tarball)
+          const shasum = createHash('sha1').update(bytes).digest('hex')
+          if (shasum !== metadata.shasum) throw new Error('Tarball SHA-1 mismatch')
+          const [algorithm, expectedIntegrity] = String(metadata.integrity).split('-', 2)
+          if (algorithm !== 'sha512') throw new Error('Tarball integrity must use SHA-512')
+          const actualIntegrity = createHash('sha512').update(bytes).digest('base64')
+          if (actualIntegrity !== expectedIntegrity) throw new Error('Tarball SHA-512 mismatch')
+          appendFileSync(process.env.GITHUB_OUTPUT, `tarball=./${tarball}\n`)
+          appendFileSync(process.env.GITHUB_OUTPUT, `package=${metadata.package}\n`)
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${metadata.version}\n`)
+          appendFileSync(process.env.GITHUB_OUTPUT, `integrity=${metadata.integrity}\n`)
+          appendFileSync(process.env.GITHUB_OUTPUT, `dist-tag=${metadata.version.includes('-') ? 'next' : 'latest'}\n`)
+          NODE
+
+      - name: Check whether the identical package is already published
+        id: registry
+        env:
+          PACKAGE_NAME: ${{ steps.artifact.outputs.package }}
+          PACKAGE_VERSION: ${{ steps.artifact.outputs.version }}
+          PACKAGE_INTEGRITY: ${{ steps.artifact.outputs.integrity }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs'
+          const target = `https://registry.npmjs.org/${encodeURIComponent(process.env.PACKAGE_NAME)}/${encodeURIComponent(process.env.PACKAGE_VERSION)}`
+          const response = await fetch(target, { headers: { accept: 'application/json' } })
+          if (response.status === 404) {
+            appendFileSync(process.env.GITHUB_OUTPUT, 'exists=false\n')
+          } else {
+            if (!response.ok) throw new Error(`npm registry returned ${response.status}`)
+            const published = await response.json()
+            if (published.dist?.integrity !== process.env.PACKAGE_INTEGRITY) {
+              throw new Error('Published package integrity differs from the verified artifact')
+            }
+            appendFileSync(process.env.GITHUB_OUTPUT, 'exists=true\n')
+          }
+          NODE
+
+      - name: Publish only the verified tarball with npm Trusted Publishing
+        if: ${{ steps.registry.outputs.exists != 'true' }}
+        run: npm publish "${{ steps.artifact.outputs.tarball }}" --tag "${{ steps.artifact.outputs.dist-tag }}" --access public --provenance --ignore-scripts --registry=https://registry.npmjs.org/
+
+  github-release:
+    needs: [select, build-package, publish]
+    if: ${{ needs.select.outputs.mode == 'publish' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download publication metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-publication
+          path: release-artifact
+
+      - name: Read release identity
+        id: release
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const metadata = JSON.parse(readFileSync('release-artifact/release.json', 'utf8'))
+          if (!/^@[a-z0-9-]+\/[a-z0-9-]+$/.test(metadata.package)) throw new Error('Unsafe package name')
+          if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(metadata.version)) {
+            throw new Error('Unsafe package version')
+          }
+          if (metadata.tag !== `v${metadata.version}`) throw new Error('Release tag and version differ')
+          appendFileSync(process.env.GITHUB_OUTPUT, `tag=${metadata.tag}\n`)
+          appendFileSync(process.env.GITHUB_OUTPUT, `title=${metadata.package}@${metadata.version}\n`)
+          NODE
+
+      - name: Create GitHub release and tag idempotently
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if lookup_error="$(gh api --silent "repos/${GITHUB_REPOSITORY}/releases/tags/${{ steps.release.outputs.tag }}" 2>&1)"; then
+            echo 'GitHub release already exists with the expected tag.'
+          elif [[ "$lookup_error" == *'(HTTP 404)'* ]]; then
+            gh release create "${{ steps.release.outputs.tag }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "${{ steps.release.outputs.title }}" \
+              --generate-notes
+          else
+            echo "$lookup_error" >&2
+            exit 1
+          fi
+
+  bootstrap-required:
+    needs: select
+    if: ${{ needs.select.outputs.mode == 'publish' && vars.NPM_TRUSTED_PUBLISHING_READY != 'true' }}
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Explain the first-release gate
+        run: |
+          echo 'Package publication is intentionally disabled.'
+          echo 'Complete the human first-publish and Trusted Publisher setup in docs/README, then set NPM_TRUSTED_PUBLISHING_READY=true.'

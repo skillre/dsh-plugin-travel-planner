@@ -1,0 +1,26 @@
+# Install the travel planner for this bundle.
+#
+# Row 1 owns the trip store, the AMap CLI gateway, the `travel_*` model tools,
+# and the `travelPlanner` capability. It mounts in every profile.
+#
+# Row 2 carries the browser API. It is a separate row because it must wait for
+# the live `webServer` service: a single row that reads the web server late can
+# bind an already-replaced instance and silently lose its routes, and a single
+# row that declares `webServer` up front would never mount in a profile without
+# the Web GUI.
+#
+# The two `*Ref` values are DSH CREDENTIAL REFERENCES (names), never key values.
+# Store the AMap Web (JS API) key once — for example as `AMAP_KEY` in the DSH
+# environment or credential store — and the rows resolve it at call time.
+- insert:
+    - id: skillre-travel-planner
+      name: '@skillre/dsh-plugin-travel-planner'
+      config:
+        amap:
+          webKeyRef: AMAP_KEY
+          securityKeyRef: AMAP_SECURITY_KEY
+          # Web-service key: answers POI photo/phone lookups over HTTPS with no
+          # CLI and no container, so the AMap window never opens for them.
+          restKeyRef: AMAP_REST_KEY
+    - id: skillre-travel-planner-web
+      name: '@skillre/dsh-plugin-travel-planner/web'
