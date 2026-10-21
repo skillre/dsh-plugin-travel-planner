@@ -35,8 +35,27 @@ for (const [index, record] of compatibility.verified.entries()) {
   ) {
     throw new Error(`${label}.checks must include dump-config and bounded-startup`)
   }
-  if (manifest.dsh?.client !== undefined && !record.checks.includes('browser')) {
-    throw new Error(`${label}.checks must include browser for a Client package`)
+}
+
+// A Client package must carry real target-UI evidence in the record of the
+// release being prepared (verified[0], newest first). Older records may
+// document a DSH line verified before the UI pass existed, and the documented
+// check vocabulary accepts the whole browser family: `browser`, `browser-*`
+// and `web-ui-*` (see docs/evidence/compatibility-notes.md).
+const BROWSER_CHECK = /^(?:browser(?:-|$)|web-ui-)/
+if (manifest.dsh?.client !== undefined) {
+  const newestChecks = Array.isArray(compatibility.verified[0]?.checks)
+    ? compatibility.verified[0].checks
+    : []
+  if (
+    !newestChecks.some(
+      (check) => typeof check === 'string' && BROWSER_CHECK.test(check),
+    )
+  ) {
+    throw new Error(
+      'compatibility.json verified[0].checks must include a browser UI check ' +
+        '(browser, browser-* or web-ui-*) for a Client package',
+    )
   }
 }
 
