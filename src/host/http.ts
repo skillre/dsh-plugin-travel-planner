@@ -190,6 +190,25 @@ export function registerTravelHttp(
         })
         return
       }
+      if (req.method === 'POST' && route === '/fill-transits') {
+        // A batch fill needs no field to work; an absent body means "every day".
+        const raw = await readJsonBody(req)
+        if (raw !== undefined && !isRecord(raw)) {
+          sendJson(res, 400, { ok: false, error: 'request body must be a JSON object' })
+          return
+        }
+        const body = raw ?? {}
+        const sessionId = typeof body['sessionId'] === 'string' ? body['sessionId'] : undefined
+        const tripId = typeof body['tripId'] === 'string' ? body['tripId'] : undefined
+        const dayId = typeof body['dayId'] === 'string' && body['dayId'].trim() !== '' ? body['dayId'].trim() : undefined
+        // A day that cannot be planned is reported in `days` with its reason:
+        // a missing key, or a container that is not running, is not a server
+        // failure, and answering 500 would make the panel show a crash instead
+        // of the one thing the user can fix.
+        const filled = await deps.service.fillTransits(sessionId, tripId, dayId)
+        sendJson(res, 200, { ok: true, ...filled, days: [...filled.days] })
+        return
+      }
       if (req.method === 'POST' && route === '/refresh-places') {
         const body = await readJsonBody(req)
         if (!isRecord(body)) {

@@ -1,26 +1,8 @@
 # Uninstall and rollback
 
-Remove the bundle from a profile:
+In your DSH Desktop Client or Web UI **Plugins** manager, select `@skillre/dsh-plugin-travel-planner` and confirm removal. To roll back, you choose a compatible known-good version from a supported, verified source in that manager, remove the faulty version and install/enable the replacement, if supported; restart when requested and check the result. Developers/agents do not remove preexisting user plugins, install replacements or edit the user's profile for them.
 
-```sh
-dsh plugin --profile <profile> remove @skillre/dsh-plugin-travel-planner
-```
-
-Roll back to a known-good version:
-
-```sh
-dsh plugin --profile <profile> remove @skillre/dsh-plugin-travel-planner
-dsh plugin --profile <profile> add @skillre/dsh-plugin-travel-planner@<known-good-version>
-```
-
-Then inspect and start the profile:
-
-```sh
-dsh --profile <profile> --dump-config
-dsh --profile <profile>
-```
-
-If the plugin prevents the Web GUI from starting, perform recovery from the CLI; do not depend on the GUI being available.
+Temporary developer installs must use an owned disposable **non-Desktop** profile: stop the test process, remove only test-created bundle/dependency/selection/config state or the confirmed owned profile, and verify cleanup even after failure. A real Desktop/Web user-profile test requires prior consent, baseline inventory and a reversible plan; restore only test-created changes, preserving preexisting installations and data. If the manager cannot start, arrange separately authorized CLI/profile recovery; do not assume CLI `--profile desktop` can operate on Electron's managed `desktop` profile.
 
 Removing the package removes its Bundle layer: both composed rows, every `travel_*` tool, the browser API route, and the sidebar tab.
 

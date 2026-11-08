@@ -47,6 +47,7 @@ import { addDays, itemIdFor, slugify, tripIdFor } from '../src/host/ids.js'
 import { parsePatchOps } from '../src/host/patch-input.js'
 import { summarize, TripStore, TripStoreError } from '../src/host/trip-store.js'
 import type { TripFs, TripFsTarget, TripSummary } from '../src/host/trip-store.js'
+import { isTransitFillDay, parseTransferTitle } from '../src/host/transit-fill.js'
 import { TravelService } from '../src/host/travel-service.js'
 import { registerTravelTools } from '../src/host/tools.js'
 import { amapRuntimeView, buildTravelView, countAlerts, severityLabel } from '../src/host/view.js'
@@ -697,6 +698,36 @@ describe('parsePatchOps', () => {
     expect(result.ops).toEqual([])
     expect(result.violations[0]?.message).toContain('transit.from')
   })
+
+  it('accepts a coordinate on an end that names no place', () => {
+    const result = parsePatchOps([
+      {
+        kind: 'set-day-transit',
+        dayId: 'day1',
+        transit: {
+          id: 't1',
+          from: { label: '西安', point: { longitude: 108.94, latitude: 34.34, coordinateSystem: 'gcj02' } },
+          to: { label: '成都' },
+        },
+      },
+    ])
+
+    expect(result.violations).toEqual([])
+    expect(result.ops[0]).toMatchObject({
+      kind: 'set-day-transit',
+      transit: { from: { label: '西安', point: { longitude: 108.94, latitude: 34.34 } } },
+    })
+
+    const outOfRange = parsePatchOps([
+      {
+        kind: 'set-day-transit',
+        dayId: 'day1',
+        transit: { id: 't2', from: { label: '西安', point: { longitude: 999, latitude: 34 } }, to: { label: '成都' } },
+      },
+    ])
+    expect(outOfRange.ops).toEqual([])
+    expect(outOfRange.violations[0]?.message).toContain('transit.from.point.longitude')
+  })
 })
 
 describe('buildTravelView', () => {
@@ -1173,6 +1204,9 @@ function createFakeSubprocess(
         stdin: undefined,
         stdout: undefined,
         stderr: undefined,
+        // Added by the DSH 0.2.2 subprocess contract: a caller-owned duplex that
+        // is absent unless the spec asks for one.
+        control: undefined,
         collected: { stdout: readerFor(options.stdout ?? ''), stderr: readerFor(options.stderr ?? '') },
         done,
         terminate: kill,
@@ -2058,6 +2092,69 @@ describe('POST /refresh-places', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// Web-service stubs
+// ---------------------------------------------------------------------------
+
+/** A fetch stand-in that answers AMap's geocode and driving endpoints. */
+interface RestStub {
+  /** Pass as `restFetch`. */
+  readonly impl: typeof fetch
+  /** Every requested URL, in call order. */
+  readonly urls: readonly string[]
+}
+
+/**
+ * Answer the two Web-service endpoints from a table.
+ *
+ * The service reaches AMap over HTTPS, so the only way to exercise a geocode or
+ * a planned road without a network is to hand it a fetch. Every other REST test
+ * injects `fetchImpl` directly; this helper is the same seam one layer up.
+ *
+ * @param answers - coordinates by address, the driving route to return, and a
+ *   status to fail every call with.
+ * @returns the fetch implementation plus the URLs it was asked for.
+ */
+function restStub(
+  answers: {
+    readonly geocodes?: Readonly<Record<string, readonly [number, number]>>
+    readonly route?: { readonly distanceMeters: number; readonly durationSeconds: number; readonly polyline: string }
+    /** When set, every call fails with this HTTP status. */
+    readonly failStatus?: number
+  } = {},
+): RestStub {
+  const urls: string[] = []
+  const impl = (async (input: string | URL) => {
+    const url = String(input)
+    urls.push(url)
+    const json = (payload: unknown, status = 200): Response =>
+      new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } })
+    if (answers.failStatus !== undefined) return new Response('{}', { status: answers.failStatus })
+    if (url.includes('/v3/geocode/geo')) {
+      const address = new URL(url).searchParams.get('address') ?? ''
+      const point = answers.geocodes?.[address]
+      const geocodes = point === undefined ? [] : [{ formatted_address: address, location: `${point[0]},${point[1]}` }]
+      return json({ status: '1', info: 'OK', infocode: '10000', count: String(geocodes.length), geocodes })
+    }
+    if (url.includes('/v5/direction/driving')) {
+      const route = answers.route
+      const paths =
+        route === undefined
+          ? []
+          : [
+              {
+                distance: String(route.distanceMeters),
+                cost: { duration: String(route.durationSeconds), tolls: '0' },
+                steps: [{ instruction: '驶入京昆高速', polyline: route.polyline }],
+              },
+            ]
+      return json({ status: '1', info: 'OK', infocode: '10000', route: { paths } })
+    }
+    return json({ status: '0', info: 'UNKNOWN_ENDPOINT', infocode: '20000' })
+  }) as typeof fetch
+  return { impl, urls }
+}
+
 describe('transit days', () => {
   const WORKSPACE = '/workspace'
   const SUBDIRECTORY = '.travel'
@@ -2096,7 +2193,7 @@ describe('transit days', () => {
 
   it('projects a transit with both ends, its path and where the figures came from', () => {
     const view = buildTravelView(makeTransitProject(), [], [], viewContext(0.9))
-    const transit = view.days[0]?.transits[0]
+    const transit = view.days[0]?.transits?.[0]
 
     // The end that points at a place gets that place's coordinate; the end that
     // is only a name does not need one.
@@ -2109,6 +2206,43 @@ describe('transit days', () => {
     // The stop list is untouched: the transit is not a place to visit.
     expect(view.days[0]?.items).toEqual([])
     expect(view.days[1]?.transits).toEqual([])
+  })
+
+  it('projects a name-only end from the point its geocode stored', () => {
+    const project = makeProject({
+      places: [makePlace('p1', { name: '回民街' })],
+      scenarios: [
+        makeScenario('main', [
+          makeDay('day1', {
+            title: '北京 → 西安｜赶路 1,077km',
+            transits: [
+              {
+                id: 't1',
+                from: {
+                  label: '北京',
+                  point: { longitude: 116.4074, latitude: 39.9042, coordinateSystem: 'gcj02' },
+                },
+                // A stale stored point must lose to the library's own coordinate.
+                to: { placeId: 'p1', label: '回民街', point: { longitude: 1, latitude: 2, coordinateSystem: 'gcj02' } },
+                mode: 'driving',
+                steps: [],
+                freshness: 'stale',
+                source: { provider: 'title', fetchedAt: NOW },
+              },
+            ],
+          }),
+        ]),
+      ],
+    })
+
+    const transit = buildTravelView(project, [], [], viewContext(0.9)).days[0]?.transits?.[0]
+
+    expect(transit?.from).toEqual({
+      label: '北京',
+      point: { longitude: 116.4074, latitude: 39.9042, coordinateSystem: 'gcj02' },
+    })
+    expect(transit?.to.label).toBe('回民街')
+    expect(transit?.to.point).toMatchObject({ latitude: 30.28 })
   })
 
   it('writes a transit from the figures the caller has, and marks them stale', async () => {
@@ -2185,6 +2319,555 @@ describe('transit days', () => {
     expect(transit?.arriveAt).toBe('2026-10-01T18:38:00+08:00')
     // A place id is enough on its own: the label comes from the library.
     expect(transit?.from.label).toBe('地点 p1')
+  })
+
+  const DOCUMENT = `${STORE_DIR}/projects/trip-1/trip.json`
+
+  /** A service over one seeded trip, with an optional key and fetch stub. */
+  function transitApi(
+    options: {
+      readonly project?: TripProject
+      readonly restKey?: string
+      /** When true, resolving the credential reference itself rejects. */
+      readonly restKeyThrows?: boolean
+      readonly restFetch?: typeof fetch
+      readonly gateway?: AmapGateway
+    } = {},
+  ): { readonly fake: FakeFsHandle; readonly service: TravelService } {
+    const fake = createFakeFs()
+    fake.seed(DOCUMENT, `${JSON.stringify(options.project ?? makeProject({ id: 'trip-1' }), null, 2)}\n`)
+    const restKey =
+      options.restKeyThrows === true
+        ? async (): Promise<string | undefined> => {
+            throw new Error('credentials service refused')
+          }
+        : options.restKey === undefined
+          ? undefined
+          : async (): Promise<string | undefined> => options.restKey
+    const service = new TravelService({
+      fs: fake.fs,
+      subdirectory: '.travel',
+      currency: 'CNY',
+      fallbackCwd: WORKSPACE,
+      cwdFor: async () => WORKSPACE,
+      clock: () => Date.parse(NOW),
+      ...restKey === undefined ? {} : { restKey },
+      ...options.restFetch === undefined ? {} : { restFetch: options.restFetch },
+      ...options.gateway === undefined ? {} : { gateway: () => options.gateway },
+    })
+    return { fake, service }
+  }
+
+  it('geocodes a name-only end and writes the coordinate back onto it', async () => {
+    const calls = restStub({
+      geocodes: { 西安: [108.93977, 34.341574], 成都: [104.0668, 30.5728] },
+      route: { distanceMeters: 723_000, durationSeconds: 29_520, polyline: '108.9,34.2;104.1,30.6' },
+    })
+    const { service } = transitApi({ restKey: 'rest-key', restFetch: calls.impl })
+
+    const written = await service.setDayTransit(undefined, 'trip-1', 'day1', {
+      from: { label: '西安' },
+      to: { label: '成都' },
+      mode: 'driving',
+    })
+
+    expect(written.planned).toBe(true)
+    const transit = (await service.require(undefined, 'trip-1')).scenarios[0]?.days[0]?.transits?.[0]
+    // The end keeps the name the user wrote and gains the coordinate the map
+    // needs; the road itself arrives from the Web-service route call.
+    expect(transit?.from).toEqual({
+      label: '西安',
+      point: { longitude: 108.93977, latitude: 34.341574, coordinateSystem: 'gcj02' },
+    })
+    expect(transit?.to.point).toMatchObject({ longitude: 104.0668 })
+    expect(transit?.polyline).toBe('108.9,34.2;104.1,30.6')
+    expect(calls.urls.filter((url) => url.includes('/v3/geocode/geo'))).toHaveLength(2)
+    expect(calls.urls.filter((url) => url.includes('/v5/direction/driving'))).toHaveLength(1)
+  })
+
+  it('keeps a name-only end as a name when the geocode fails, and still writes', async () => {
+    const calls = restStub({ failStatus: 500 })
+    const { service } = transitApi({ restKey: 'rest-key', restFetch: calls.impl })
+
+    const written = await service.setDayTransit(undefined, 'trip-1', 'day1', {
+      from: { label: '西安' },
+      to: { label: '成都' },
+      distanceMeters: 723_000,
+      plan: false,
+    })
+
+    // A geocode is a nicety for the map: an unreachable provider must not turn a
+    // writable transit into an error.
+    expect(written.planned).toBe(false)
+    const transit = (await service.require(undefined, 'trip-1')).scenarios[0]?.days[0]?.transits?.[0]
+    expect(transit?.from).toEqual({ label: '西安' })
+    expect(transit?.distanceMeters).toBe(723_000)
+    expect(transit?.freshness).toBe('stale')
+  })
+
+  it('does not geocode an end that already carries a coordinate', async () => {
+    const calls = restStub({ geocodes: { 西安: [108.94, 34.34] } })
+    const { service } = transitApi({ restKey: 'rest-key', restFetch: calls.impl })
+
+    await service.setDayTransit(undefined, 'trip-1', 'day1', {
+      from: { label: '西安', point: { longitude: 108.94, latitude: 34.34, coordinateSystem: 'gcj02' } },
+      to: { label: '成都', point: { longitude: 104.07, latitude: 30.57, coordinateSystem: 'gcj02' } },
+      plan: false,
+    })
+
+    expect(calls.urls).toEqual([])
+  })
+
+  it('keeps the write when resolving the credential itself fails', async () => {
+    const { service } = transitApi({ restKeyThrows: true })
+
+    const written = await service.setDayTransit(undefined, 'trip-1', 'day1', {
+      from: { label: '西安' },
+      to: { label: '成都' },
+      distanceMeters: 723_000,
+      plan: false,
+    })
+
+    // Resolving the key belongs to the best-effort geocode: a credentials
+    // service that refuses may cost the coordinate, never the transit.
+    expect(written.planned).toBe(false)
+    const transit = (await service.require(undefined, 'trip-1')).scenarios[0]?.days[0]?.transits?.[0]
+    expect(transit?.from).toEqual({ label: '西安' })
+    expect(transit?.distanceMeters).toBe(723_000)
+  })
+
+  it('plans nothing, and still writes, when the credential provider fails', async () => {
+    const { service } = transitApi({ restKeyThrows: true })
+
+    const written = await service.setDayTransit(undefined, 'trip-1', 'day1', {
+      from: { label: '西安', point: { longitude: 108.94, latitude: 34.34, coordinateSystem: 'gcj02' } },
+      to: { label: '成都', point: { longitude: 104.07, latitude: 30.57, coordinateSystem: 'gcj02' } },
+      distanceMeters: 723_000,
+      mode: 'driving',
+    })
+
+    // With both ends located, planning asks for the key — and a refusing
+    // credential provider is "no key", so the caller's own figures are kept.
+    expect(written.planned).toBe(false)
+    const transit = (await service.require(undefined, 'trip-1')).scenarios[0]?.days[0]?.transits?.[0]
+    expect(transit?.distanceMeters).toBe(723_000)
+    expect(transit?.freshness).toBe('stale')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Batch fill: the 「补全 N 天路线」 button
+// ---------------------------------------------------------------------------
+
+describe('transit fill candidates', () => {
+  it('reads the two ends and the distance a title states', () => {
+    expect(parseTransferTitle('西安 → 成都｜翻秦岭 723km')).toEqual({ from: '西安', to: '成都', distanceMeters: 723_000 })
+    expect(parseTransferTitle('北京 → 西安｜赶路 1,077km')).toEqual({ from: '北京', to: '西安', distanceMeters: 1_077_000 })
+    expect(parseTransferTitle('大理｜洱海完整一天')).toEqual({})
+  })
+
+  it('offers only days whose title claims a road nothing records', () => {
+    const transit: TripTransit = {
+      id: 't1',
+      from: { label: '西安' },
+      to: { label: '成都' },
+      mode: 'driving',
+      steps: [],
+      freshness: 'fresh',
+      source: { provider: 'amap-cli', fetchedAt: NOW },
+    }
+
+    expect(isTransitFillDay(makeDay('day1', { title: '西安 → 成都｜723km' }))).toBe(true)
+    // A recorded transit already answers the title's claim.
+    expect(isTransitFillDay(makeDay('day1', { title: '西安 → 成都｜723km', transits: [transit] }))).toBe(false)
+    // A real leg does too: `travel_day_rebuild_legs` wrote one.
+    expect(
+      isTransitFillDay(
+        makeDay('day1', {
+          title: '西安 → 成都｜723km',
+          legs: [makeLeg('l1', 'i1', 'i2', { distanceMeters: 723_000, mode: 'driving' })],
+        }),
+      ),
+    ).toBe(false)
+    // A leg under both thresholds is a placeholder two stops at the same point
+    // produce, so it must not hide the road the title states.
+    expect(
+      isTransitFillDay(
+        makeDay('day1', {
+          title: '西安 → 成都｜723km',
+          legs: [makeLeg('l1', 'i1', 'i2', { distanceMeters: 300, durationSeconds: 240 })],
+        }),
+      ),
+    ).toBe(true)
+    // No arrow, no claim.
+    expect(isTransitFillDay(makeDay('day1', { title: '成都｜休整' }))).toBe(false)
+    // A clock range uses the same arrow and is a schedule, not a journey.
+    expect(isTransitFillDay(makeDay('day1', { title: '11:00 → 15:00 拍摄' }))).toBe(false)
+  })
+
+  it('counts a leg as recorded exactly when the panel does', () => {
+    // The panel's rule is `distanceMeters >= 1000 || durationSeconds >= 600`, and
+    // the pass has to answer the button that offers it: a day the panel already
+    // draws must not be offered for filling, and a placeholder must not hide a
+    // title's road.
+    const withLeg = (distanceMeters: number, durationSeconds: number): boolean =>
+      isTransitFillDay(
+        makeDay('day1', {
+          title: '西安 → 成都｜723km',
+          legs: [makeLeg('l1', 'i1', 'i2', { distanceMeters, durationSeconds })],
+        }),
+      )
+
+    expect(withLeg(723_000, 45_480)).toBe(false)
+    // Under a kilometre but over ten minutes: still a recorded move, because the
+    // panel's rule is an OR — 900 seconds is fifteen minutes, past the 600s bar.
+    expect(withLeg(700, 900)).toBe(false)
+    // Short of both thresholds: the placeholder `travel_day_rebuild_legs` writes.
+    expect(withLeg(999, 599)).toBe(true)
+    // Either half is enough on its own.
+    expect(withLeg(1_000, 60)).toBe(false)
+    expect(withLeg(300, 600)).toBe(false)
+  })
+})
+
+describe('fillTransits', () => {
+  const PREFIX = '/api/skillre-travel'
+  const WORKSPACE = '/workspace'
+  const STORE_DIR = `${WORKSPACE}/.travel`
+  const DOCUMENT = `${STORE_DIR}/projects/trip-1/trip.json`
+  const SAME_ORIGIN = { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' }
+
+  /** The trip a fill pass is built for: two days whose only road is a title. */
+  function makeFillProject(): TripProject {
+    return makeProject({
+      id: 'trip-1',
+      // A driving trip: the Web-service driving route is the point of the pass.
+      preferences: makePreferences({ preferredModes: ['driving'] }),
+      places: [makePlace('p1', { name: '宽窄巷子' })],
+      scenarios: [
+        makeScenario('main', [
+          makeDay('day1', { date: '2026-10-01', title: '西安 → 成都｜翻秦岭 723km', items: [makeItem('i1', 'p1')] }),
+          makeDay('day2', { date: '2026-10-02', title: '成都 → 丽江｜到站 821km' }),
+          makeDay('day3', { date: '2026-10-03', title: '丽江｜婚纱照拍摄日' }),
+        ]),
+      ],
+    })
+  }
+
+  /** A trip whose stops already name the two ends of the day's road. */
+  function makeLocatedProject(): TripProject {
+    return makeProject({
+      id: 'trip-1',
+      preferences: makePreferences({ preferredModes: ['driving'] }),
+      places: [makePlace('p-xian', { name: '西安' }), makePlace('p-chengdu', { name: '成都' })],
+      scenarios: [
+        makeScenario('main', [makeDay('day1', { date: '2026-10-01', title: '西安 → 成都｜翻秦岭 723km' })]),
+      ],
+    })
+  }
+
+  /** A fill service over the seeded trip, plus the browser route over it. */
+  function fillApi(
+    options: {
+      readonly project?: TripProject
+      readonly restKey?: string
+      /** When true, resolving the credential reference itself rejects. */
+      readonly restKeyThrows?: boolean
+      readonly restFetch?: typeof fetch
+      readonly gateway?: AmapGateway
+    } = {},
+  ): { readonly fake: FakeFsHandle; readonly service: TravelService; readonly handler: RegisteredRoute['handler'] } {
+    const fake = createFakeFs()
+    fake.seed(DOCUMENT, `${JSON.stringify(options.project ?? makeFillProject(), null, 2)}\n`)
+    const restKey =
+      options.restKeyThrows === true
+        ? async (): Promise<string | undefined> => {
+            throw new Error('credentials service refused')
+          }
+        : options.restKey === undefined
+          ? undefined
+          : async (): Promise<string | undefined> => options.restKey
+    const service = new TravelService({
+      fs: fake.fs,
+      subdirectory: '.travel',
+      currency: 'CNY',
+      fallbackCwd: WORKSPACE,
+      cwdFor: async () => WORKSPACE,
+      clock: () => Date.parse(NOW),
+      ...restKey === undefined ? {} : { restKey },
+      ...options.restFetch === undefined ? {} : { restFetch: options.restFetch },
+      ...options.gateway === undefined ? {} : { gateway: () => options.gateway },
+    })
+    const web = createFakeWebServer()
+    registerTravelHttp({} as unknown as Context, web.server, PREFIX, {
+      service,
+      configuration: () => ({ configured: true, missing: [] }),
+    })
+    const route = web.routes[0]
+    if (route === undefined) throw new Error('no route registered')
+    return { fake, service, handler: route.handler }
+  }
+
+  it('plans every day whose title claims a road, over the Web-service API', async () => {
+    const calls = restStub({
+      geocodes: { 西安: [108.94, 34.34], 成都: [104.07, 30.57], 丽江: [100.23, 26.86] },
+      route: { distanceMeters: 723_000, durationSeconds: 29_520, polyline: '108.9,34.2;104.1,30.6' },
+    })
+    const { fake, service } = fillApi({ restKey: 'rest-key', restFetch: calls.impl })
+
+    const filled = await service.fillTransits(undefined, 'trip-1')
+
+    expect(filled.planned).toBe(2)
+    expect(filled.skipped).toBe(0)
+    expect(filled.days.map((day) => day.dayId)).toEqual(['day1', 'day2'])
+    expect(filled.days.every((day) => day.planned && day.polyline && day.distanceMeters === 723_000)).toBe(true)
+
+    const stored = JSON.parse(fake.text(DOCUMENT) ?? '{}') as TripProject
+    const days = stored.scenarios[0]?.days ?? []
+    const transits = days.flatMap((day) => day.transits ?? [])
+    expect(transits).toHaveLength(2)
+    expect(transits.every((transit) => transit.freshness === 'fresh' && transit.polyline !== undefined)).toBe(true)
+    expect(transits[0]?.from).toEqual({
+      label: '西安',
+      point: { longitude: 108.94, latitude: 34.34, coordinateSystem: 'gcj02' },
+    })
+    // The day whose title claims nothing stays untouched.
+    expect(days[2]?.transits).toBeUndefined()
+  })
+
+  it('reports one reason per day, and never throws, when no provider is configured', async () => {
+    const { fake, service } = fillApi()
+
+    const filled = await service.fillTransits(undefined, 'trip-1')
+
+    expect(filled).toEqual({
+      planned: 0,
+      skipped: 2,
+      days: [
+        { dayId: 'day1', planned: false, polyline: false, reason: '没有可用的高德 Web 服务 Key' },
+        { dayId: 'day2', planned: false, polyline: false, reason: '没有可用的高德 Web 服务 Key' },
+      ],
+    })
+    // A day that cannot be planned is left exactly as it was.
+    expect(fake.writes).toEqual([])
+  })
+
+  it('names the endpoints it could not locate', async () => {
+    const calls = restStub({ geocodes: { 成都: [104.07, 30.57] } })
+    const { service } = fillApi({ restKey: 'rest-key', restFetch: calls.impl })
+
+    const filled = await service.fillTransits(undefined, 'trip-1', 'day1')
+
+    expect(filled.days[0]).toEqual({
+      dayId: 'day1',
+      planned: false,
+      polyline: false,
+      reason: '地理编码没有找到「西安」的坐标',
+    })
+  })
+
+  it('falls back to the CLI without letting it start a container', async () => {
+    const calls: { readonly allowStart?: boolean }[] = []
+    const gateway = {
+      planRoute: (_input: unknown, _signal?: unknown, options: { readonly allowStart?: boolean } = {}) => {
+        calls.push(options)
+        return Promise.resolve({
+          mode: 'driving',
+          distanceMeters: 723_000,
+          durationSeconds: 29_520,
+          steps: [{ instruction: '驶入京昆高速', distanceMeters: 700_000, durationSeconds: 28_000 }],
+          from: { name: '西安', point: { longitude: 108.94, latitude: 34.34, coordinateSystem: 'gcj02' } },
+          to: { name: '成都', point: { longitude: 104.07, latitude: 30.57, coordinateSystem: 'gcj02' } },
+          fetchedAt: NOW,
+          fromCache: false,
+        })
+      },
+    } as unknown as AmapGateway
+    const { service } = fillApi({ project: makeLocatedProject(), gateway })
+
+    const filled = await service.fillTransits(undefined, 'trip-1', 'day1')
+
+    expect(filled.planned).toBe(1)
+    expect(filled.days[0]).toMatchObject({ dayId: 'day1', planned: true, polyline: false, distanceMeters: 723_000 })
+    // A batch pass may not open the AMap desktop window by itself.
+    expect(calls).toEqual([{ allowStart: false }])
+  })
+
+  it('reports a day whose road the provider could not return', async () => {
+    // Geocoding answers; the driving endpoint does not. With no CLI gateway
+    // there is nothing else to ask, and nothing may be written.
+    const calls = restStub({ geocodes: { 西安: [108.94, 34.34], 成都: [104.07, 30.57] } })
+    const { fake, service } = fillApi({ restKey: 'rest-key', restFetch: calls.impl })
+    const before = fake.text(DOCUMENT)
+
+    const filled = await service.fillTransits(undefined, 'trip-1', 'day1')
+
+    expect(filled.planned).toBe(0)
+    expect(filled.skipped).toBe(1)
+    expect(filled.days[0]?.planned).toBe(false)
+    expect(filled.days[0]?.polyline).toBe(false)
+    expect(filled.days[0]?.reason).toContain('没有返回这条驾车路线')
+    expect(fake.text(DOCUMENT)).toBe(before)
+    expect(fake.writes).toEqual([])
+  })
+
+  it('reports every day instead of throwing when the credential provider fails', async () => {
+    const { fake, service } = fillApi({ restKeyThrows: true })
+
+    const filled = await service.fillTransits(undefined, 'trip-1')
+
+    // A refusing credentials service is "no key" for this pass: the days keep
+    // their reasons and the request stays a 200.
+    expect(filled.planned).toBe(0)
+    expect(filled.skipped).toBe(2)
+    expect(filled.days.every((day) => day.reason === '没有可用的高德 Web 服务 Key')).toBe(true)
+    expect(fake.writes).toEqual([])
+  })
+
+  it('does not report a day whose write was refused', async () => {
+    const calls = restStub({
+      geocodes: { 西安: [108.94, 34.34], 成都: [104.07, 30.57] },
+      route: { distanceMeters: 723_000, durationSeconds: 29_520, polyline: '108.9,34.2;104.1,30.6' },
+    })
+    const { fake, service } = fillApi({ restKey: 'rest-key', restFetch: calls.impl })
+    const before = fake.text(DOCUMENT)
+    const stored = await service.require(undefined, 'trip-1')
+    // A patch layer that refuses the op. A valid transit cannot normally reach
+    // this, which is exactly why the claim has to come from the outcome rather
+    // than from the planning result.
+    service.patch = async () => ({
+      project: stored,
+      outcome: {
+        project: stored,
+        applied: [],
+        rejected: [{ index: 0, kind: 'set-day-transit', code: 'INVALID_VALUE', reason: '转场距离必须是非负数' }],
+        changed: false,
+      },
+      validation: service.validate(stored),
+    })
+
+    const filled = await service.fillTransits(undefined, 'trip-1', 'day1')
+
+    expect(filled.planned).toBe(0)
+    expect(filled.days[0]).toEqual({
+      dayId: 'day1',
+      planned: false,
+      polyline: false,
+      reason: '补全结果被校验拒绝：转场距离必须是非负数',
+    })
+    expect(fake.text(DOCUMENT)).toBe(before)
+  })
+
+  it('says why one explicitly named day needs nothing', async () => {
+    const project = makeProject({
+      id: 'trip-1',
+      preferences: makePreferences({ preferredModes: ['driving'] }),
+      scenarios: [
+        makeScenario('main', [
+          makeDay('day1', {
+            date: '2026-10-01',
+            title: '西安 → 成都｜723km',
+            transits: [
+              {
+                id: 't1',
+                from: { label: '西安' },
+                to: { label: '成都' },
+                mode: 'driving',
+                steps: [],
+                freshness: 'fresh',
+                source: { provider: 'amap-cli', fetchedAt: NOW },
+              },
+            ],
+          }),
+        ]),
+      ],
+    })
+    const { service } = fillApi({ project })
+
+    const filled = await service.fillTransits(undefined, 'trip-1', 'day1')
+
+    expect(filled).toEqual({
+      planned: 0,
+      skipped: 1,
+      days: [{ dayId: 'day1', planned: false, polyline: false, reason: '这一天已经记录了转场或里程，无需补全' }],
+    })
+  })
+
+  it('refuses a day the trip does not have', async () => {
+    const { service } = fillApi()
+
+    await expect(service.fillTransits(undefined, 'trip-1', 'day9')).rejects.toThrow(/day9 天不存在/)
+  })
+
+  describe('over the browser API', () => {
+    /** Post one fill request. */
+    const fillOverHttp = (
+      handler: RegisteredRoute['handler'],
+      body: Record<string, unknown>,
+    ): ReturnType<typeof callApi> =>
+      callApi(handler, {
+        method: 'POST',
+        url: `${PREFIX}/fill-transits`,
+        headers: { ...SAME_ORIGIN, 'content-type': 'application/json' },
+        body,
+      })
+
+    it('answers the per-day result and never 500s without a provider', async () => {
+      const api = fillApi()
+
+      const response = await fillOverHttp(api.handler, {})
+
+      expect(response.status).toBe(200)
+      expect(response.payload).toEqual({
+        ok: true,
+        planned: 0,
+        skipped: 2,
+        days: [
+          { dayId: 'day1', planned: false, polyline: false, reason: '没有可用的高德 Web 服务 Key' },
+          { dayId: 'day2', planned: false, polyline: false, reason: '没有可用的高德 Web 服务 Key' },
+        ],
+      })
+    })
+
+    it('accepts a request with no body at all', async () => {
+      const api = fillApi()
+
+      const response = await callApi(api.handler, {
+        method: 'POST',
+        url: `${PREFIX}/fill-transits`,
+        headers: SAME_ORIGIN,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.payload['ok']).toBe(true)
+    })
+
+    it('plans the one day the caller names', async () => {
+      const calls = restStub({
+        geocodes: { 西安: [108.94, 34.34], 成都: [104.07, 30.57] },
+        route: { distanceMeters: 723_000, durationSeconds: 29_520, polyline: '108.9,34.2;104.1,30.6' },
+      })
+      const api = fillApi({ restKey: 'rest-key', restFetch: calls.impl })
+
+      const response = await fillOverHttp(api.handler, { dayId: 'day1' })
+
+      expect(response.status).toBe(200)
+      expect(response.payload['planned']).toBe(1)
+      expect(response.payload['skipped']).toBe(0)
+      expect((response.payload['days'] as readonly { readonly dayId: string }[]).map((day) => day.dayId)).toEqual([
+        'day1',
+      ])
+    })
+
+    it('answers 404 for a day the trip does not have', async () => {
+      const api = fillApi()
+
+      const response = await fillOverHttp(api.handler, { dayId: 'day9' })
+
+      expect(response.status).toBe(404)
+      expect(response.payload['ok']).toBe(false)
+      expect(response.payload['code']).toBe('TRIP_NOT_FOUND')
+    })
   })
 })
 

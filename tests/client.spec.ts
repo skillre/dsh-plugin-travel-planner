@@ -114,7 +114,14 @@ function captureRegistrations(): Captured {
 }
 
 /** Render the pure panel for one view. */
-function renderPanel(view: TravelView, overrides: { readonly amapReady?: boolean } = {}): string {
+function renderPanel(
+  view: TravelView,
+  overrides: {
+    readonly amapReady?: boolean
+    /** 只有需要这个入口时才给：缺省就是「老宿主没有这条路由」。 */
+    readonly onFillTransits?: (dayId?: string) => Promise<{ readonly planned: number; readonly skipped: number }>
+  } = {},
+): string {
   const exports = loadBundle()
   const Panel = exports['TravelPanel'] as (props: unknown) => unknown
   return renderToStaticMarkup(
@@ -124,6 +131,7 @@ function renderPanel(view: TravelView, overrides: { readonly amapReady?: boolean
       amapReady: overrides.amapReady ?? true,
       onMutate: async () => undefined,
       onFocusDay: async () => undefined,
+      ...overrides.onFillTransits === undefined ? {} : { onFillTransits: overrides.onFillTransits },
     }) as never,
   )
 }
@@ -494,7 +502,17 @@ describe('shipped client bundle', () => {
         items: [stop, { ...stop, id: 'x2', placeId: 'p-y', name: '大理' }],
       },
     ])
-    expect(inbound[0]).toMatchObject({ origin: '丽江', destination: '大理', source: 'recorded', distanceMeters: 175_000 })
+    expect(inbound[0]).toMatchObject({
+      origin: '丽江',
+      destination: '大理',
+      source: 'recorded',
+      distanceMeters: 175_000,
+      // The stops at each end travel with the hop — the previous day's last stop
+      // and the arriving day's first — so promoting it into a transit gives the
+      // road coordinates to be drawn between.
+      fromPlaceId: 'ginkaku',
+      toPlaceId: 'p-x',
+    })
 
     // …and a stay day is not a hop at all: no 「丽江古城 → 丽江古城」 row. The
     // stay-day fixture keeps its stop in the city the previous day ended in.
@@ -726,10 +744,12 @@ describe('shipped client bundle', () => {
     expect(render('day')).toContain('trv-map-strip')
     expect(render('all')).not.toContain('trv-map-strip')
     expect(render('all')).not.toContain('trv-legend')
-    // The note explains the dashed line of a single day; the whole-trip view
-    // needs no key, because the day list carries each day's colour.
+    // The note is the map's key. It used to explain only the single-day dashed
+    // line, but the whole-trip view now draws driving routes of its own, so the
+    // key travels with both ranges.
     expect(render('day')).toContain('trv-map-note')
-    expect(render('all')).not.toContain('trv-map-note')
+    expect(render('all')).toContain('trv-map-note')
+    expect(render('all')).toContain('实线=已规划路线 · 长虚线=按标题估算')
   })
 
   it('anchors each day at its first stop and numbers the rest', () => {
@@ -836,6 +856,114 @@ describe('shipped client bundle', () => {
     expect(recorded.note).toBeUndefined()
   })
 
+  it('knows where the map should go when a stop is picked', () => {
+    const focusPointFor = loadBundle()['focusPointFor'] as (
+      groups: readonly unknown[],
+      placeId: string | undefined,
+    ) => { readonly longitude: number; readonly latitude: number } | undefined
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const groups = [
+      { dayId: 'd1', date: '2026-10-01', dayOrder: 1, stops: [{ placeId: 'p1', point: point(120.1, 30.2) }] },
+      { dayId: 'd2', date: '2026-10-02', dayOrder: 2, stops: [{ placeId: 'p2', point: point(108.9, 34.2) }] },
+    ]
+
+    expect(focusPointFor(groups, 'p2')).toEqual(point(108.9, 34.2))
+    // Nothing picked, nothing to move to.
+    expect(focusPointFor(groups, undefined)).toBeUndefined()
+    // A place the map is not drawing — another day's stop while one day is on
+    // screen — has no marker to travel to.
+    expect(focusPointFor([groups[0] as never], 'p2')).toBeUndefined()
+  })
+
+  it('draws a day that has nothing but a transit', () => {
+    const buildGroups = loadBundle()['buildGroups'] as (
+      days: readonly unknown[],
+      day: unknown,
+      range: string,
+    ) => readonly { readonly dayId: string; readonly stops: readonly unknown[] }[]
+    const transitEnds = loadBundle()['transitEnds'] as (
+      groups: readonly unknown[],
+      days: readonly unknown[],
+    ) => readonly unknown[]
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const driveDay = {
+      id: 'd2',
+      date: '2026-10-02',
+      title: '西安 → 成都',
+      items: [],
+      legs: [],
+      totalDistanceMeters: 0,
+      totalDurationSeconds: 0,
+      transits: [
+        {
+          id: 't1',
+          from: { label: '西安', point: point(108.9, 34.2) },
+          to: { label: '成都', point: point(104.1, 30.7) },
+          mode: 'driving',
+          distanceMeters: 723_000,
+          freshness: 'fresh',
+          stale: false,
+          source: 'amap-cli',
+          steps: [],
+        },
+      ],
+      alertIds: [],
+    }
+    const stopDay = {
+      ...driveDay,
+      id: 'd1',
+      transits: undefined,
+      items: [
+        {
+          id: 'i1',
+          placeId: 'p1',
+          name: '西湖',
+          category: '风景名胜',
+          address: '地址',
+          point: point(120.1, 30.2),
+          locked: false,
+          notes: [],
+          alertIds: [],
+        },
+      ],
+    }
+    const days = [stopDay, driveDay]
+
+    // The whole trip: the driving day is drawn, because its ends are located.
+    const all = buildGroups(days, days[0], 'all')
+    expect(all.map((group) => group.dayId)).toEqual(['d1', 'd2'])
+    expect(all[1]?.stops).toEqual([])
+    expect(transitEnds(all, days)).toHaveLength(2)
+
+    // And on its own: this is the day the map used to answer with
+    // 「这一天还没有带坐标的地点。」
+    const single = buildGroups(days, driveDay, 'day')
+    expect(single.map((group) => group.dayId)).toEqual(['d2'])
+    expect(transitEnds(single, days)).toHaveLength(2)
+
+    // A day with neither a stop nor a located end is still skipped.
+    const empty = buildGroups([{ ...stopDay, id: 'd0', items: [], transits: [] }], days[0], 'all')
+    expect(empty).toEqual([])
+
+    // The sketch renders the two ends rather than the empty state.
+    const markup = renderToStaticMarkup(
+      react.createElement(loadBundle()['TripMap'] as never, {
+        map: { enabled: false, version: '2.0', style: 'normal' },
+        days,
+        day: driveDay,
+        range: 'day',
+        tier: 'compact',
+        activeDayId: 'd2',
+        selectedPlaceId: undefined,
+        onRange: () => undefined,
+        onTier: () => undefined,
+        onSelect: () => undefined,
+      }) as never,
+    )
+    expect(markup).toContain('class="trv-map-end"')
+    expect(markup).not.toContain('trv-map-empty')
+  })
+
   it('gives a day spent driving its own card instead of a made-up stop', () => {
     const view = makeView()
     const first = view.days[0]
@@ -921,6 +1049,8 @@ describe('shipped client bundle', () => {
     const op = transitOpFromTransfer('d2', {
       origin: '西安',
       destination: '成都',
+      fromPlaceId: 'huimin',
+      toPlaceId: 'kuanzhai',
       distanceMeters: 723_000,
       source: 'title',
     })
@@ -928,8 +1058,10 @@ describe('shipped client bundle', () => {
     expect(op['dayId']).toBe('d2')
     expect(op['transit']).toMatchObject({
       id: 'd2-transit-1',
-      from: { label: '西安' },
-      to: { label: '成都' },
+      // The city names stay what the reader sees; the stops they left from and
+      // reached are what the map draws the road between.
+      from: { label: '西安', placeId: 'huimin' },
+      to: { label: '成都', placeId: 'kuanzhai' },
       distanceMeters: 723_000,
       // Nothing has planned the road yet, so the day says so.
       freshness: 'stale',
@@ -1349,5 +1481,645 @@ describe('shipped client bundle', () => {
 
     expect(JSON.stringify(first.tabDefinition)).toBe(JSON.stringify(second.tabDefinition))
     expect(first.effectLabels).toEqual(second.effectLabels)
+  })
+
+  // 赶路日在地图上必须有路可画，而且一眼看得出是「已经规划过的路」还是「只有标题
+  // 的估算」。下面几组用例沿着 driveRoutes 的三级降级逐级验证。
+  it('derives one road per day from a transit, a long leg or a title alone', () => {
+    const driveRoutes = loadBundle()['driveRoutes'] as (days: readonly unknown[]) => readonly {
+      readonly id: string
+      readonly dayId: string
+      readonly colorIndex: number
+      readonly path: readonly (readonly [number, number])[]
+      readonly meters?: number
+      readonly seconds?: number
+      readonly kind: string
+      readonly label: string
+    }[]
+    const point = (longitude: number, latitude: number) => ({
+      longitude,
+      latitude,
+      coordinateSystem: 'gcj02',
+    })
+    const stop = (id: string, placeId: string, longitude: number, latitude: number): Record<string, unknown> => ({
+      id,
+      placeId,
+      name: id,
+      category: '风景名胜',
+      address: '地址',
+      point: point(longitude, latitude),
+      locked: false,
+      notes: [],
+      alertIds: [],
+    })
+    // 旧宿主没有 transits 字段，所以这里默认就不写它：缺字段的日子照样要能算。
+    const day = (id: string, extra: Record<string, unknown>): Record<string, unknown> => ({
+      id,
+      date: '2026-10-01',
+      title: id,
+      items: [],
+      legs: [],
+      totalDistanceMeters: 0,
+      totalDurationSeconds: 0,
+      alertIds: [],
+      ...extra,
+    })
+
+    // ① 有转场：用转场的真实路径与数字，标题里的估算让位。
+    const transit = day('d2', {
+      title: '西安 → 成都｜翻秦岭 723km',
+      transits: [
+        {
+          id: 'd2-transit-1',
+          from: { label: '西安', point: point(108.9, 34.2) },
+          to: { label: '成都', point: point(104.1, 30.7) },
+          mode: 'driving',
+          distanceMeters: 723_000,
+          durationSeconds: 29_520,
+          freshness: 'fresh',
+          stale: false,
+          source: 'amap-rest',
+          polyline: '108.9,34.2;106.4,32.4;104.1,30.7',
+          steps: [],
+        },
+      ],
+    })
+    const planned = driveRoutes([transit])
+
+    expect(planned).toHaveLength(1)
+    expect(planned[0]).toMatchObject({ dayId: 'd2', colorIndex: 0, kind: 'planned', meters: 723_000, seconds: 29_520 })
+    expect(planned[0]?.path).toEqual([
+      [108.9, 34.2],
+      [106.4, 32.4],
+      [104.1, 30.7],
+    ])
+    expect(planned[0]?.label).toBe('驾车 · 723 km · 8 小时 12 分')
+
+    // 没有 polyline 时两端直连，仍然是「已规划」；也没有时长可写时不编一个。
+    const straight = driveRoutes([
+      day('d2', {
+        transits: [
+          {
+            id: 't1',
+            from: { label: '西安', point: point(108.9, 34.2) },
+            to: { label: '成都', point: point(104.1, 30.7) },
+            mode: 'driving',
+            freshness: 'fresh',
+            stale: false,
+            source: 'amap-cli',
+            steps: [],
+          },
+        ],
+      }),
+    ])
+    expect(straight[0]?.path).toEqual([
+      [108.9, 34.2],
+      [104.1, 30.7],
+    ])
+    expect(straight[0]?.kind).toBe('planned')
+    expect(straight[0]?.label).toBe('驾车')
+
+    // ② 没有转场，但一整天就是一段长途 leg：两端站点就是这条路，数字取 leg 的。
+    const longLeg = day('d1', {
+      title: '北京 → 西安｜赶路 1077km',
+      items: [stop('a', 'pa', 116.4, 39.9), stop('b', 'pb', 108.9, 34.2)],
+      legs: [
+        {
+          id: 'l1',
+          fromItemId: 'a',
+          toItemId: 'b',
+          mode: 'driving',
+          distanceMeters: 1_077_000,
+          durationSeconds: 45_480,
+          freshness: 'fresh',
+          stale: false,
+          steps: [],
+        },
+      ],
+    })
+    const road = driveRoutes([longLeg])
+
+    expect(road).toHaveLength(1)
+    expect(road[0]).toMatchObject({ kind: 'planned', meters: 1_077_000, seconds: 45_480 })
+    expect(road[0]?.path).toEqual([
+      [116.4, 39.9],
+      [108.9, 34.2],
+    ])
+    expect(road[0]?.label).toBe('驾车 · 1077 km · 12 小时 38 分')
+
+    // 同一段长途只占当天移动时间的两成时，这一天还是市内游玩，不是赶路日。
+    expect(
+      driveRoutes([
+        day('d1', {
+          legs: [
+            { id: 'l1', fromItemId: 'a', toItemId: 'b', mode: 'driving', distanceMeters: 200_000, durationSeconds: 7_200, freshness: 'fresh', stale: false, steps: [] },
+            { id: 'l2', fromItemId: 'b', toItemId: 'c', mode: 'walking', distanceMeters: 5_000, durationSeconds: 28_800, freshness: 'fresh', stale: false, steps: [] },
+          ],
+        }),
+      ]),
+    ).toEqual([])
+
+    // ③ 只剩标题：坐标借相邻两天的站点（前一天最后一站 → 后一天第一站），标签带 ≈。
+    const before = day('d1', { items: [stop('a', 'pa', 116.4, 39.9)] })
+    const onlyTitle = day('d2', { title: '西安 → 成都｜翻秦岭 723km' })
+    const after = day('d3', { items: [stop('b', 'pb', 104.1, 30.7)] })
+    const estimated = driveRoutes([before, onlyTitle, after])
+
+    expect(estimated).toHaveLength(1)
+    expect(estimated[0]).toMatchObject({ dayId: 'd2', colorIndex: 1, kind: 'estimated', meters: 723_000 })
+    expect(estimated[0]?.seconds).toBeUndefined()
+    expect(estimated[0]?.path).toEqual([
+      [116.4, 39.9],
+      [104.1, 30.7],
+    ])
+    expect(estimated[0]?.label).toBe('驾车 · ≈723 km · 按标题估算')
+
+    // ④ 什么都说不出的一天：不凭空编一条路，也不因为缺字段而崩。
+    expect(driveRoutes([before])).toEqual([])
+    expect(driveRoutes([day('d9', { title: '丽江｜拍照', items: [stop('a', 'pa', 100.2, 25.1)] })])).toEqual([])
+  })
+
+  it('draws a driving day that has no located stop of its own', () => {
+    const buildGroups = loadBundle()['buildGroups'] as (
+      days: readonly unknown[],
+      day: unknown,
+      range: string,
+    ) => readonly { readonly dayId: string; readonly dayOrder: number; readonly stops: readonly unknown[] }[]
+    const TripMap = loadBundle()['TripMap'] as (props: unknown) => unknown
+    const view = makeView()
+    const first = view.days[0]
+    const second = view.days[1]
+    if (first === undefined || second === undefined) throw new Error('fixture is missing its days')
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const stop = (id: string, placeId: string, name: string, longitude: number, latitude: number) => ({
+      id,
+      placeId,
+      name,
+      category: '风景名胜',
+      address: '地址',
+      point: point(longitude, latitude),
+      locked: false,
+      notes: [],
+      alertIds: [],
+    })
+    // D1 游玩、D2 只有标题（整天在路上、一个站点都没有）、D3 到达丽江。
+    const days = [
+      { ...first, items: [stop('d1-i0', 'p1', '清水寺', 116.4, 39.9), stop('d1-i1', 'p2', '银阁寺', 117.1, 39.2)] },
+      { ...second, title: '西安 → 成都｜翻秦岭 723km', items: [], transits: [] },
+      { ...second, id: 'd3', date: '2026-10-04', title: '成都 → 丽江｜到站 821km', items: [stop('d3-i0', 'p3', '丽江古城', 100.2, 26.9)] },
+    ]
+
+    const whole = buildGroups(days, days[0], 'all')
+    expect(whole.map((group) => group.dayId)).toEqual(['d1', 'd2', 'd3'])
+    // 它没有站点，但有一条路：这正是过去被整组跳过的那个「整天赶路」的日子。
+    expect(whole[1]?.stops).toEqual([])
+
+    const single = buildGroups(days, days[1], 'day')
+    expect(single.map((group) => group.dayId)).toEqual(['d2'])
+
+    // 当天模式打开这个赶路日：示意图不再回答「这一天还没有带坐标的地点」。
+    const html = renderToStaticMarkup(
+      react.createElement(TripMap as never, {
+        map: { enabled: false, version: '2.0', style: 'normal' },
+        days,
+        day: days[1],
+        range: 'day',
+        tier: 'comfortable',
+        activeDayId: 'd2',
+        selectedPlaceId: undefined,
+        onRange: () => undefined,
+        onTier: () => undefined,
+        onSelect: () => undefined,
+      }) as never,
+    )
+    expect(html).not.toContain('trv-map-empty')
+    expect(html).toContain('class="trv-line trv-drive-line trv-drive-line-estimated"')
+  })
+
+  it('separates a planned road from a title-only estimate, with a capsule on each', () => {
+    const TripMap = loadBundle()['TripMap'] as (props: unknown) => unknown
+    const view = makeView()
+    const first = view.days[0]
+    const second = view.days[1]
+    if (first === undefined || second === undefined) throw new Error('fixture is missing its days')
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const stop = (id: string, placeId: string, name: string, longitude: number, latitude: number) => ({
+      id,
+      placeId,
+      name,
+      category: '风景名胜',
+      address: '地址',
+      point: point(longitude, latitude),
+      locked: false,
+      notes: [],
+      alertIds: [],
+    })
+    const days = [
+      { ...first, items: [stop('d1-i0', 'p1', '清水寺', 116.4, 39.9), stop('d1-i1', 'p2', '银阁寺', 117.1, 39.2)] },
+      // 只有标题：这一天的线只能是长虚线。
+      { ...second, title: '西安 → 成都｜翻秦岭 723km', items: [], transits: [] },
+      {
+        ...second,
+        id: 'd3',
+        date: '2026-10-04',
+        title: '成都 → 丽江｜到站 821km',
+        items: [stop('d3-i0', 'p3', '丽江古城', 100.2, 26.9)],
+        // 有转场：这一天的线是已经规划过的实线。
+        transits: [
+          {
+            id: 'd3-transit-1',
+            from: { label: '成都', point: point(104.1, 30.7) },
+            to: { label: '丽江', point: point(100.2, 26.9) },
+            mode: 'driving',
+            distanceMeters: 821_000,
+            durationSeconds: 40_800,
+            freshness: 'fresh',
+            stale: false,
+            source: 'amap-rest',
+            steps: [],
+          },
+        ],
+      },
+    ]
+
+    const html = renderToStaticMarkup(
+      react.createElement(TripMap as never, {
+        map: { enabled: false, version: '2.0', style: 'normal' },
+        days,
+        day: days[0],
+        range: 'all',
+        tier: 'comfortable',
+        activeDayId: 'd2',
+        selectedPlaceId: undefined,
+        onRange: () => undefined,
+        onTier: () => undefined,
+        onSelect: () => undefined,
+      }) as never,
+    )
+
+    // 站点顺序还是那条细虚线，路线各用各的 class：实线一条、长虚线一条。
+    expect(html).toContain('class="trv-line"')
+    expect((html.match(/class="trv-line trv-drive-line"/g) ?? [])).toHaveLength(1)
+    expect((html.match(/class="trv-line trv-drive-line trv-drive-line-estimated"/g) ?? [])).toHaveLength(1)
+    // 胶囊压在路的中点上，估算的那条把「这是标题里的数字」写在脸上。
+    expect((html.match(/class="trv-drive-label"/g) ?? [])).toHaveLength(2)
+    expect(html).toContain('驾车 · 821 km · 11 小时 20 分')
+    expect(html).toContain('驾车 · ≈723 km · 按标题估算')
+    // 图例说明两种线型，全程模式也带着。
+    expect(html).toContain('实线=已规划路线 · 长虚线=按标题估算')
+  })
+
+  it('offers one click for the days that only state their hop', () => {
+    const fillReport = loadBundle()['fillReport'] as (planned: number, skipped: number) => string
+    const view = makeView()
+    const first = view.days[0]
+    const second = view.days[1]
+    if (first === undefined || second === undefined) throw new Error('fixture is missing its days')
+    const withHop = { ...view, days: [first, { ...second, title: '京都 → 奈良｜45km' }] }
+    const fill = async (): Promise<{ readonly planned: number; readonly skipped: number }> => ({ planned: 1, skipped: 0 })
+
+    // 元素本身，不是内联样式表里的那条规则 —— 样式表里同样有这个名字。
+    const html = renderPanel(withHop, { onFillTransits: fill })
+    expect(html).toContain('class="trv-map-fill"')
+    expect(html).toContain('补全 1 天路线')
+
+    // 没有「只有标题」的日子，就没有入口。
+    expect(renderPanel(makeView(), { onFillTransits: fill })).not.toContain('class="trv-map-fill"')
+    // 老宿主没有这条路由时同样不给按钮：点不出结果的按钮比没有按钮更糟。
+    expect(renderPanel(withHop)).not.toContain('class="trv-map-fill"')
+
+    // 结果要说清楚补上了几天、又跳过了几天。
+    expect(fillReport(2, 0)).toBe('已补全 2 天路线。')
+    expect(fillReport(2, 1)).toBe('已补全 2 天路线，跳过 1 天。')
+    expect(fillReport(0, 3)).toBe('没有补全任何路线，跳过 3 天。')
+    expect(fillReport(0, 0)).toBe('没有需要补全的路线。')
+  })
+
+  // 真实行程（14 天）里「丽江 → 大理 175km」那天后面还跟着 13km 的市内挪窝：175km 占
+  // 里程 93%，却只占移动时长 77%，只按时间判就会把这条 175km 的路整条漏掉。
+  it('draws the long hop of a day that also carries short city legs', () => {
+    const driveRoutes = loadBundle()['driveRoutes'] as (days: readonly unknown[]) => readonly {
+      readonly dayId: string
+      readonly kind: string
+      readonly meters?: number
+      readonly seconds?: number
+      readonly label: string
+      readonly path: readonly (readonly [number, number])[]
+    }[]
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const stop = (id: string, placeId: string, name: string, longitude: number, latitude: number) => ({
+      id,
+      placeId,
+      name,
+      category: '风景名胜',
+      address: '地址',
+      point: point(longitude, latitude),
+      locked: false,
+      notes: [],
+      alertIds: [],
+    })
+    const leg = (id: string, fromItemId: string, toItemId: string, distanceMeters: number, durationSeconds: number) => ({
+      id,
+      fromItemId,
+      toItemId,
+      mode: 'driving',
+      distanceMeters,
+      durationSeconds,
+      freshness: 'fresh',
+      stale: false,
+      steps: [],
+    })
+    const day = (id: string, title: string, items: readonly unknown[], legs: readonly unknown[]) => ({
+      id,
+      date: '2026-10-01',
+      title,
+      items,
+      legs,
+      totalDistanceMeters: 0,
+      totalDurationSeconds: 0,
+      alertIds: [],
+    })
+
+    // 丽江 → 大理：175.1 km / 153 min，加上洱海边 7 km、6 km 两段。
+    const moving = day(
+      'd5',
+      '丽江 → 大理｜175km，洱海第一晚',
+      [
+        stop('d5-i1', 'p1', '丽江古城', 100.24, 26.87),
+        stop('d5-i2', 'p2', '洱海公园', 100.25, 25.6),
+        stop('d5-i3', 'p3', '洱海', 100.19, 25.79),
+        stop('d5-i4', 'p4', '洱海公园', 100.25, 25.6),
+      ],
+      [
+        leg('l1', 'd5-i1', 'd5-i2', 175_100, 9_180),
+        leg('l2', 'd5-i2', 'd5-i3', 7_000, 1_380),
+        leg('l3', 'd5-i3', 'd5-i4', 6_000, 1_320),
+      ],
+    )
+    const routes = driveRoutes([moving])
+
+    expect(routes).toHaveLength(1)
+    // 它是「已经算过的路」，不是「按标题估算」：数字来自那段 leg。
+    expect(routes[0]).toMatchObject({ dayId: 'd5', kind: 'planned', meters: 175_100, seconds: 9_180 })
+    expect(routes[0]?.label).toBe('驾车 · 175.1 km · 2 小时 33 分')
+    expect(routes[0]?.path).toEqual([
+      [100.24, 26.87],
+      [100.25, 25.6],
+    ])
+
+    // 一整天只在洱海边挪窝（6 km + 7 km）：没有 100 km 的路，就没有路线。
+    expect(
+      driveRoutes([
+        day(
+          'd6',
+          '大理｜洱海完整一天',
+          [stop('a', 'pa', 'A', 100.1, 25.7), stop('b', 'pb', 'B', 100.2, 25.8)],
+          [leg('l1', 'a', 'b', 7_000, 1_380), leg('l2', 'b', 'a', 6_000, 1_320)],
+        ),
+      ]),
+    ).toEqual([])
+
+    // 一段 200 km 的路，但当天还爬了 120 km／200 min 的山：里程占 62%、时间占 9%，
+    // 两个口径都说不上「主导」，这一天仍然不是赶路日。
+    expect(
+      driveRoutes([
+        day(
+          'd9',
+          '某天',
+          [stop('a', 'pa', 'A', 100.1, 25.7), stop('b', 'pb', 'B', 103.1, 26.7)],
+          [leg('l1', 'a', 'b', 200_000, 1_200), leg('l2', 'b', 'a', 120_000, 12_000)],
+        ),
+      ]),
+    ).toEqual([])
+  })
+
+  // 只有标题的赶路日落在行程首尾时，没有「相邻两天」可以借端点：过去这种日子在图上
+  // 是空的，面板于是回答「这一天还没有带坐标的地点」。
+  it('draws a title-only drive day at either end of the trip', () => {
+    const driveRoutes = loadBundle()['driveRoutes'] as (days: readonly unknown[]) => readonly {
+      readonly dayId: string
+      readonly kind: string
+      readonly label: string
+      readonly path: readonly (readonly [number, number])[]
+    }[]
+    const buildGroups = loadBundle()['buildGroups'] as (
+      days: readonly unknown[],
+      day: unknown,
+      range: string,
+    ) => readonly { readonly dayId: string }[]
+    const TripMap = loadBundle()['TripMap'] as (props: unknown) => unknown
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const stop = (id: string, placeId: string, name: string, longitude: number, latitude: number) => ({
+      id,
+      placeId,
+      name,
+      category: '风景名胜',
+      address: '地址',
+      point: point(longitude, latitude),
+      locked: false,
+      notes: [],
+      alertIds: [],
+    })
+    const day = (id: string, date: string, title: string, items: readonly unknown[]) => ({
+      id,
+      date,
+      title,
+      items,
+      legs: [],
+      totalDistanceMeters: 0,
+      totalDurationSeconds: 0,
+      alertIds: [],
+    })
+
+    // 末位：最后一天整天在赶路、一个站点都没有；标题里的两个地名与行程里两个站点同名。
+    const endingWithDrive = [
+      day('d1', '2026-10-01', '丽江｜婚纱照', [stop('d1-i1', 'p1', '丽江古城', 100.23, 26.87)]),
+      day('d2', '2026-10-02', '大理｜洱海一天', [stop('d2-i1', 'p2', '大理古城', 100.16, 25.69)]),
+      day('d3', '2026-10-03', '丽江古城 → 昆明南站｜还车赶飞机 340km', []),
+    ]
+    const last = driveRoutes(endingWithDrive)
+
+    expect(last).toHaveLength(1)
+    expect(last[0]).toMatchObject({ dayId: 'd3', kind: 'estimated' })
+    expect(last[0]?.label).toBe('驾车 · ≈340 km · 按标题估算')
+    // from 用与标题同名的那个站点（丽江古城），to 借不到后面的站点时退回行程里最后一个
+    // 有坐标的站点（大理古城）—— 两端都说得出来，这条线就画得出来。
+    expect(last[0]?.path).toEqual([
+      [100.23, 26.87],
+      [100.16, 25.69],
+    ])
+    // 它不再被绘制集合跳过，当天模式打开也能画。
+    expect(buildGroups(endingWithDrive, endingWithDrive[2], 'all').map((group) => group.dayId)).toEqual(['d1', 'd2', 'd3'])
+    expect(buildGroups(endingWithDrive, endingWithDrive[2], 'day').map((group) => group.dayId)).toEqual(['d3'])
+
+    const single = renderToStaticMarkup(
+      react.createElement(TripMap as never, {
+        map: { enabled: false, version: '2.0', style: 'normal' },
+        days: endingWithDrive,
+        day: endingWithDrive[2],
+        range: 'day',
+        tier: 'comfortable',
+        activeDayId: 'd3',
+        selectedPlaceId: undefined,
+        onRange: () => undefined,
+        onTier: () => undefined,
+        onSelect: () => undefined,
+      }) as never,
+    )
+    expect(single).not.toContain('trv-map-empty')
+    expect(single).toContain('class="trv-line trv-drive-line trv-drive-line-estimated"')
+
+    // 两天两站、末位那天只有标题：借不到「后面第一个站点」，就退回整个行程最后一个有
+    // 坐标的站点（洱海公园），它和出发点不同，于是仍然有一条估算线。
+    const twoDays = [
+      day('d1', '2026-10-01', '大理｜洱海一天', [
+        stop('d1-i1', 'p1', '大理古城', 100.16, 25.69),
+        stop('d1-i2', 'p2', '洱海公园', 100.25, 25.6),
+      ]),
+      day('d2', '2026-10-02', '大理 → 昆明｜赶飞机 340km', []),
+    ]
+    const two = driveRoutes(twoDays)
+    expect(two).toHaveLength(1)
+    expect(two[0]?.path).toEqual([
+      [100.25, 25.6],
+      [100.16, 25.69],
+    ])
+
+    // 首位：第一天空着，端点只能向后借。
+    const startingWithDrive = [
+      day('d1', '2026-10-01', '丽江 → 大理｜175km', []),
+      day('d2', '2026-10-02', '大理｜洱海一天', [stop('d2-i1', 'p1', '大理古城', 100.16, 25.69)]),
+      day('d3', '2026-10-03', '双廊｜拍照', [stop('d3-i1', 'p2', '双廊古镇', 100.18, 25.86)]),
+    ]
+    const first = driveRoutes(startingWithDrive)
+    expect(first).toHaveLength(1)
+    expect(first[0]).toMatchObject({ dayId: 'd1', kind: 'estimated' })
+    expect(first[0]?.path).toEqual([
+      [100.16, 25.69],
+      [100.18, 25.86],
+    ])
+
+    // 整个行程只有一个有坐标的点：首尾只能重合，那种「线」不该画。
+    expect(
+      driveRoutes([
+        day('d1', '2026-10-01', '大理｜洱海一天', [stop('d1-i1', 'p1', '大理古城', 100.16, 25.69)]),
+        day('d2', '2026-10-02', '大理 → 昆明｜赶飞机 340km', []),
+      ]),
+    ).toEqual([])
+  })
+
+  // 给一条已有转场补上真实 polyline（「用高德重算」或「补全 N 天路线」之后）不会改变
+  // 站点数，也不会改变未被覆盖的端点数：只有把路线自己也放进 key，地图才会重新 fit。
+  it('refits when a road is replanned under the same stops', () => {
+    const fitKeyOf = loadBundle()['fitKeyOf'] as (
+      range: string,
+      groups: readonly unknown[],
+      days: readonly unknown[],
+      box: string,
+    ) => string
+    const buildGroups = loadBundle()['buildGroups'] as (days: readonly unknown[], day: unknown, range: string) => readonly unknown[]
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const stop = (id: string, placeId: string, name: string, longitude: number, latitude: number) => ({
+      id,
+      placeId,
+      name,
+      category: '风景名胜',
+      address: '地址',
+      point: point(longitude, latitude),
+      locked: false,
+      notes: [],
+      alertIds: [],
+    })
+    const transit = (polyline?: string) => ({
+      id: 'd1-transit-1',
+      // 两端就是当天的两个站点，所以端点数不会因为这条路而改变。
+      from: { label: 'A', point: point(116.4, 39.9) },
+      to: { label: 'B', point: point(108.9, 34.2) },
+      mode: 'driving',
+      distanceMeters: 1_077_000,
+      durationSeconds: 45_480,
+      freshness: 'stale',
+      stale: true,
+      source: 'title',
+      steps: [],
+      ...polyline === undefined ? {} : { polyline },
+    })
+    const days = (polyline?: string) => [
+      {
+        id: 'd1',
+        date: '2026-10-01',
+        title: '北京 → 西安｜赶路 1077km',
+        items: [stop('d1-i1', 'p1', 'A', 116.4, 39.9), stop('d1-i2', 'p2', 'B', 108.9, 34.2)],
+        legs: [],
+        totalDistanceMeters: 0,
+        totalDurationSeconds: 0,
+        transits: [transit(polyline)],
+        alertIds: [],
+      },
+    ]
+
+    const straight = days(undefined)
+    const routed = days('116.4,39.9;112,37;108.9,34.2')
+    const groups = buildGroups(straight, straight[0], 'all')
+
+    // 同样的绘制集合与画布，重画一次不该重新 fit。
+    expect(fitKeyOf('all', groups, days(undefined), '480x648')).toBe(fitKeyOf('all', groups, straight, '480x648'))
+    // 站点数一样、路线从两点直连变成三点的真实路径：这是新的画面，必须重新 fit。
+    expect(fitKeyOf('all', groups, routed, '480x648')).not.toBe(fitKeyOf('all', groups, straight, '480x648'))
+  })
+
+  // 有转场的日子过去画两条完全重叠的线（旧的 trv-transit-line 与新的 trv-drive-line）。
+  it('draws one line per transit instead of the old one on top of the new one', () => {
+    const TripMap = loadBundle()['TripMap'] as (props: unknown) => unknown
+    const point = (longitude: number, latitude: number) => ({ longitude, latitude, coordinateSystem: 'gcj02' })
+    const days = [
+      {
+        id: 'd1',
+        date: '2026-10-01',
+        title: '西安 → 成都｜翻秦岭 723km',
+        items: [
+          { id: 'd1-i1', placeId: 'p1', name: '西安', category: '风景名胜', address: '地址', point: point(108.9, 34.2), locked: false, notes: [], alertIds: [] },
+          { id: 'd1-i2', placeId: 'p2', name: '成都', category: '风景名胜', address: '地址', point: point(104.1, 30.7), locked: false, notes: [], alertIds: [] },
+        ],
+        legs: [],
+        totalDistanceMeters: 0,
+        totalDurationSeconds: 0,
+        transits: [
+          {
+            id: 't1',
+            from: { label: '西安', point: point(108.9, 34.2) },
+            to: { label: '成都', point: point(104.1, 30.7) },
+            mode: 'driving',
+            distanceMeters: 723_000,
+            durationSeconds: 29_520,
+            freshness: 'fresh',
+            stale: false,
+            source: 'amap-rest',
+            polyline: '108.9,34.2;106.4,32.4;104.1,30.7',
+            steps: [],
+          },
+        ],
+        alertIds: [],
+      },
+    ]
+
+    const html = renderToStaticMarkup(
+      react.createElement(TripMap as never, {
+        map: { enabled: false, version: '2.0', style: 'normal' },
+        days,
+        day: days[0],
+        range: 'all',
+        tier: 'comfortable',
+        activeDayId: 'd1',
+        selectedPlaceId: undefined,
+        onRange: () => undefined,
+        onTier: () => undefined,
+        onSelect: () => undefined,
+      }) as never,
+    )
+
+    expect((html.match(/class="trv-line trv-drive-line"/g) ?? [])).toHaveLength(1)
+    expect(html).not.toContain('trv-transit-line')
+    expect((html.match(/class="trv-drive-label"/g) ?? [])).toHaveLength(1)
   })
 })

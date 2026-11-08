@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Travel Planner",
+    "description": "A DSH-native AI travel planning workspace with AMap-powered places, routes, and itinerary views",
+    "detail": "docs/DETAIL.md"
+  }
+}

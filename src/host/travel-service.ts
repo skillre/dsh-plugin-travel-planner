@@ -24,8 +24,18 @@ import { buildTravelView, countAlerts, type TravelView } from './view.js'
 import { AmapCliError } from './amap/cli.js'
 import type { TripSelectionSource } from '../shared/view.js'
 import type { AmapGateway } from './amap/gateway.js'
-import type { RestFoundPlace } from './amap/rest.js'
-import { drivingRouteOverRest, getPoiByIdOverRest, searchPoisOverRest } from './amap/rest.js'
+import type { RestCallOptions, RestFoundPlace } from './amap/rest.js'
+import { drivingRouteOverRest, geocodeAddressOverRest, getPoiByIdOverRest, searchPoisOverRest } from './amap/rest.js'
+import { isTransitFillDay, parseTransferTitle } from './transit-fill.js'
+
+/**
+ * Why a fill pass could not plan a day when nothing can be asked.
+ *
+ * The panel shows this verbatim, so it names the one thing the user can change:
+ * configuring a Web-service key (the CLI alternative would open a map window,
+ * which a batch pass may not do on its own).
+ */
+const NO_PROVIDER_REASON = '没有可用的高德 Web 服务 Key'
 
 /** Dependencies of the travel service. */
 export interface TravelServiceDeps {
@@ -50,6 +60,13 @@ export interface TravelServiceDeps {
    * needed — which is what keeps a photo lookup from opening the AMap window.
    */
   readonly restKey?: () => Promise<string | undefined>
+  /**
+   * Fetch implementation used by the Web-service calls.
+   *
+   * A test seam: the REST answers are parsed by pure code in `amap/rest.ts`, but
+   * a batch fill also needs to be exercised end to end without a network.
+   */
+  readonly restFetch?: typeof fetch
   /** AMap Web (JS API) key for the in-panel map; empty disables the browser map. */
   readonly browserMapKey?: () => Promise<string | undefined>
   /** Whether the browser map is allowed at all. */
@@ -102,6 +119,8 @@ export interface TransitEndInput {
   readonly placeId?: string
   /** A name to show when there is no place: 「西安」. */
   readonly label?: string
+  /** A known coordinate for a name-only end; skips the geocode when present. */
+  readonly point?: GeoPoint
 }
 
 /**
@@ -133,6 +152,63 @@ export interface TransitWriteResult {
   /** How the figures were obtained: a planned route, or the caller's numbers. */
   readonly planned: boolean
   readonly polyline: boolean
+}
+
+/** What one day of a batch fill did. */
+export interface TransitFillDayResult {
+  readonly dayId: string
+  readonly planned: boolean
+  readonly distanceMeters?: number
+  readonly durationSeconds?: number
+  /** True when the provider's own path was stored, not just the two ends. */
+  readonly polyline: boolean
+  /** Why the day was left alone, when it was. */
+  readonly reason?: string
+}
+
+/** Outcome of one batch fill of the transits day titles claim. */
+export interface TransitFillResult {
+  /** Days whose road was planned and written. */
+  readonly planned: number
+  /** Days left alone, each with its reason. */
+  readonly skipped: number
+  readonly days: readonly TransitFillDayResult[]
+}
+
+/** One transit end after the library and the geocoder have had their say. */
+interface ResolvedTransitEnd {
+  readonly placeId?: string
+  readonly label: string
+  readonly point?: GeoPoint
+}
+
+/** What a provider answered for one transit's road. */
+interface PlannedMove {
+  readonly distanceMeters?: number
+  readonly durationSeconds?: number
+  readonly tollsYuan?: number
+  /** Provider path as `lng,lat;lng,lat…`; only the Web-service API returns one. */
+  readonly polyline?: string
+  readonly steps: readonly RouteStep[]
+  readonly fetchedAt: string
+}
+
+/**
+ * The next free transit id for a day.
+ *
+ * Counting the existing ones is not enough: an id a caller chose can already sit
+ * at the number a count would produce, and an upsert keyed by id would then
+ * overwrite somebody else's transit instead of adding one.
+ *
+ * @param day - day the transit belongs to.
+ * @returns an id of the form `d2-transit-3` that no transit of the day uses.
+ */
+function nextTransitId(day: TripDay): string {
+  const used = new Set((day.transits ?? []).map((transit) => transit.id))
+  for (let index = used.size + 1; ; index += 1) {
+    const candidate = `${day.id}-transit-${String(index)}`
+    if (!used.has(candidate)) return candidate
+  }
 }
 
 /**
@@ -184,6 +260,15 @@ export class TravelService {
   private readonly statsMemo = new Map<string, { readonly readiness: number; readonly alerts: TripStats['alerts'] }>()
   /** `direct` once a Web-service key resolved; `container` otherwise. */
   private photoMode: 'direct' | 'container' | undefined
+  /**
+   * Geocoded names, keyed by the name as written.
+   *
+   * A driving trip names the same few cities over and over — 「西安」 appears on
+   * the day that leaves it and the day that reaches it — and every lookup spends
+   * key quota. `'none'` records a name the provider does not know, which will not
+   * change under us; failures are not cached, because a key can be fixed.
+   */
+  private readonly geocodes = new Map<string, GeoPoint | 'none'>()
 
   /**
    * @param deps - filesystem, path resolution, clock and gateway seams.
@@ -376,7 +461,7 @@ export class TravelService {
     city: string | undefined,
     signal: AbortSignal | undefined,
   ): Promise<readonly RestFoundPlace[]> {
-    const call = { ...signal === undefined ? {} : { signal } }
+    const call = this.restCall(signal)
     const found: RestFoundPlace[] = []
     if (place.providerPlaceId !== undefined) {
       const exact = await getPoiByIdOverRest({ key, id: place.providerPlaceId }, call)
@@ -622,7 +707,9 @@ export class TravelService {
    * existed the only way to put one on a day was to invent a stop for it. This
    * writes the move itself: the ends may be library places (which give the map
    * coordinates) or plain names, and the figures come from a planned route when
-   * one can be had, otherwise from what the caller already knows.
+   * one can be had, otherwise from what the caller already knows. A name-only
+   * end is geocoded first when the deployment has a Web-service key, so 「成都」
+   * can be drawn on the map without inventing a stop for it.
    *
    * One implementation serves the `travel_day_set_transit` tool, the panel's
    * 「记为转场」 action and the migration path, so they cannot drift.
@@ -645,10 +732,10 @@ export class TravelService {
     const day = findDay(project, dayId)
     if (day === undefined) throw new TripStoreError('TRIP_NOT_FOUND', `第 ${dayId} 天不存在。`)
 
-    const from = this.resolveTransitEnd(project, input.from, '起点')
-    const to = this.resolveTransitEnd(project, input.to, '终点')
+    const from = await this.resolveTransitEnd(project, input.from, '起点', input.signal)
+    const to = await this.resolveTransitEnd(project, input.to, '终点', input.signal)
     const mode: TravelMode = input.mode ?? project.preferences.preferredModes[0] ?? 'driving'
-    const id = input.id ?? `${day.id}-transit-${String((day.transits ?? []).length + 1)}`
+    const id = input.id ?? nextTransitId(day)
     const fetchedAt = new Date().toISOString()
 
     let distanceMeters = input.distanceMeters
@@ -659,45 +746,23 @@ export class TravelService {
     let planned = false
     let source: TripTransit['source'] = { provider: 'title', fetchedAt }
 
-    const bothLocated = from.point !== undefined && to.point !== undefined
-    if (input.plan !== false && bothLocated && mode === 'driving') {
-      const restKey = await this.deps.restKey?.()
-      if (restKey !== undefined) {
-        // The Web-service answer carries the provider's own path; the CLI's
-        // carries turn-by-turn text but no geometry.
-        const route = await drivingRouteOverRest(
-          { key: restKey, origin: formatPoint(from.point as never), destination: formatPoint(to.point as never) },
-          { ...input.signal === undefined ? {} : { signal: input.signal } },
-        )
-        distanceMeters = route.distanceMeters
-        durationSeconds = route.durationSeconds
-        tollsYuan = route.tollsYuan
-        polyline = route.polyline === '' ? undefined : route.polyline
+    if (input.plan !== false) {
+      // A write asked for by the tool or the panel may fall back to the CLI,
+      // which answers on a running container; a batch pass passes `false` here
+      // so it can never open the AMap window.
+      const move = await this.planMove(from, to, mode, {
+        ...input.signal === undefined ? {} : { signal: input.signal },
+        allowStart: true,
+      })
+      if (move !== undefined) {
+        distanceMeters = move.distanceMeters ?? distanceMeters
+        durationSeconds = move.durationSeconds ?? durationSeconds
+        tollsYuan = move.tollsYuan
+        polyline = move.polyline
+        steps = move.steps
         planned = true
-        source = { provider: 'amap-cli', fetchedAt }
+        source = { provider: 'amap-cli', fetchedAt: move.fetchedAt }
       }
-    }
-    if (!planned && input.plan !== false && bothLocated && this.amap !== undefined) {
-      const fact = await this.amap.planRoute(
-        {
-          from: formatPoint(from.point as never),
-          to: formatPoint(to.point as never),
-          mode,
-          fromName: from.label,
-          toName: to.label,
-        },
-        input.signal,
-      )
-      distanceMeters = fact.distanceMeters
-      durationSeconds = fact.durationSeconds
-      tollsYuan = fact.tollsYuan
-      steps = fact.steps.map((step) => ({
-        instruction: step.instruction,
-        distanceMeters: step.distanceMeters,
-        durationSeconds: step.durationSeconds,
-      }))
-      planned = true
-      source = { provider: 'amap-cli', fetchedAt: fact.fetchedAt }
     }
 
     const departAt = input.departAt ?? day.items[0]?.startAt
@@ -737,26 +802,322 @@ export class TravelService {
   }
 
   /**
-   * Resolve one end of a transit against the place library.
+   * Resolve one end of a transit, and give a name-only end a coordinate.
+   *
+   * A place id is authoritative: the library already knows the name and the
+   * point. An end that is only a name is geocoded once when a Web-service key is
+   * configured, because that coordinate is what lets the map draw the road. A
+   * lookup that fails leaves the end exactly as it was — a name the provider does
+   * not know must not turn a writable transit into an error, and this path never
+   * touches the CLI, so it can never open the AMap window.
    *
    * @param project - trip project owning the library.
-   * @param end - caller's end: a place id, a label, or both.
+   * @param end - caller's end: a place id, a label, a point, or a combination.
    * @param role - 起点/终点, for the error message.
-   * @returns the stored end, with the place's name and coordinate when it has one.
+   * @param signal - caller cancellation.
+   * @returns the stored end, with a coordinate when one could be had.
    * @throws {TripStoreError} when the end names nothing at all.
    */
-  private resolveTransitEnd(
+  private async resolveTransitEnd(
     project: TripProject,
     end: TransitEndInput,
     role: string,
-  ): { readonly placeId?: string; readonly label: string; readonly point?: GeoPoint } {
+    signal: AbortSignal | undefined,
+  ): Promise<ResolvedTransitEnd> {
     const place = end.placeId === undefined ? undefined : project.places[end.placeId]
     if (place !== undefined) return { placeId: place.id, label: place.name, point: place.point }
     const label = end.label?.trim() ?? ''
     if (label === '') {
       throw new TripStoreError('TRIP_INVALID_DOCUMENT', `转场${role}需要一个地点或一个名称。`)
     }
-    return { label }
+    if (end.point !== undefined) return { label, point: end.point }
+    const point = await this.geocodeLabel(label, signal)
+    return point === undefined ? { label } : { label, point }
+  }
+
+  /**
+   * Turn a bare place name into a coordinate over the Web-service API.
+   *
+   * @param label - the name as written, e.g. 「西安」.
+   * @param signal - caller cancellation.
+   * @returns the coordinate, or undefined when there is no key, the provider has
+   *   no such name, or the lookup failed.
+   */
+  private async geocodeLabel(label: string, signal: AbortSignal | undefined): Promise<GeoPoint | undefined> {
+    const cached = this.geocodes.get(label)
+    if (cached !== undefined) return cached === 'none' ? undefined : cached
+    try {
+      // Resolving the credential is part of this best-effort lookup, not of the
+      // write it decorates: a credentials service that refuses must leave the
+      // end a name rather than fail the transit that carries it.
+      const key = await this.restKeyOrUndefined()
+      if (key === undefined || key.trim() === '') return undefined
+      const found = await geocodeAddressOverRest({ key, address: label }, this.restCall(signal))
+      if (found === undefined) {
+        this.geocodes.set(label, 'none')
+        return undefined
+      }
+      const point: GeoPoint = { longitude: found.longitude, latitude: found.latitude, coordinateSystem: 'gcj02' }
+      this.geocodes.set(label, point)
+      return point
+    } catch {
+      // A geocode only makes the map richer. Swallowing the failure keeps the
+      // name the user wrote and lets the write go through.
+      return undefined
+    }
+  }
+
+  /**
+   * Resolve the Web-service key, treating a refusing credential provider as
+   * "no key".
+   *
+   * Every caller below uses the key to make an answer better, never to decide
+   * whether a write happens, so a credentials failure belongs in the same bucket
+   * as a missing key rather than in an exception that fails the whole operation.
+   *
+   * @returns the key, or undefined when none can be resolved.
+   */
+  private async restKeyOrUndefined(): Promise<string | undefined> {
+    try {
+      return await this.deps.restKey?.()
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Options for one Web-service call: the caller signal plus the test seam. */
+  private restCall(signal?: AbortSignal): RestCallOptions {
+    return {
+      ...signal === undefined ? {} : { signal },
+      ...this.deps.restFetch === undefined ? {} : { fetchImpl: this.deps.restFetch },
+    }
+  }
+
+  /**
+   * Ask a provider for the road between two located ends.
+   *
+   * The Web-service API answers first for a driving move, because its answer
+   * carries the provider's own path; the CLI is the fallback for a deployment
+   * without that key. Whether the CLI may start a cold container is the caller's
+   * decision, which is how a batch pass stays window-free.
+   *
+   * @param from - located start.
+   * @param to - located end.
+   * @param mode - travel mode the trip prefers.
+   * @param options - cancellation, whether a cold container may be started, and
+   *   whether a Web-service failure may fall back to the CLI.
+   * @returns the provider's figures, or undefined when no provider could be asked
+   *   at all (an end without a coordinate, or neither key nor CLI).
+   * @throws {Error} when a provider was asked and failed.
+   */
+  private async planMove(
+    from: ResolvedTransitEnd,
+    to: ResolvedTransitEnd,
+    mode: TravelMode,
+    options: { readonly signal?: AbortSignal | undefined; readonly allowStart: boolean; readonly fallBackToCli?: boolean },
+  ): Promise<PlannedMove | undefined> {
+    if (from.point === undefined || to.point === undefined) return undefined
+    const origin = formatPoint(from.point)
+    const destination = formatPoint(to.point)
+    const key = await this.restKeyOrUndefined()
+    let restError: unknown
+    if (key !== undefined && key.trim() !== '' && mode === 'driving') {
+      try {
+        const route = await drivingRouteOverRest({ key, origin, destination }, this.restCall(options.signal))
+        return {
+          distanceMeters: route.distanceMeters,
+          durationSeconds: route.durationSeconds,
+          ...route.tollsYuan === undefined ? {} : { tollsYuan: route.tollsYuan },
+          ...route.polyline === '' ? {} : { polyline: route.polyline },
+          // The Web-service answer carries geometry instead of turn text, and the
+          // panel draws the path rather than reading the steps aloud.
+          steps: [],
+          fetchedAt: new Date().toISOString(),
+        }
+      } catch (error) {
+        if (options.fallBackToCli !== true) throw error
+        restError = error
+      }
+    }
+    const gateway = this.amap
+    if (gateway !== undefined) {
+      try {
+        const fact = await gateway.planRoute(
+          { from: origin, to: destination, mode, fromName: from.label, toName: to.label },
+          options.signal,
+          { allowStart: options.allowStart },
+        )
+        return {
+          distanceMeters: fact.distanceMeters,
+          durationSeconds: fact.durationSeconds,
+          ...fact.tollsYuan === undefined ? {} : { tollsYuan: fact.tollsYuan },
+          steps: fact.steps.map((step) => ({
+            instruction: step.instruction,
+            distanceMeters: step.distanceMeters,
+            durationSeconds: step.durationSeconds,
+          })),
+          fetchedAt: fact.fetchedAt,
+        }
+      } catch (error) {
+        // Both providers were asked; the reason should carry both answers,
+        // because the key path is the one the reader can actually fix.
+        if (restError !== undefined) {
+          throw new Error(`${messageOf(restError)}（高德 CLI 也没能规划：${messageOf(error)}）`)
+        }
+        throw error
+      }
+    }
+    if (restError !== undefined) throw restError
+    return undefined
+  }
+
+  /**
+   * Plan every transit a day title claims and no record accounts for.
+   *
+   * The panel's 「补全 N 天路线」 button calls this: a driving trip carries days
+   * whose only record of the road is the title, and planning them one at a time
+   * is ten operations. Nothing here starts the AMap container — a batch pass must
+   * never open a desktop window — and a day that cannot be planned is reported
+   * with its reason instead of failing the whole batch.
+   *
+   * @param sessionId - session whose workspace owns the trip.
+   * @param tripId - explicit trip id, or undefined for the active trip.
+   * @param dayId - one day to fill; every missing day when omitted.
+   * @returns how many days were written, how many were left alone, and why.
+   * @throws {TripStoreError} when the trip, or the requested day, does not exist.
+   */
+  async fillTransits(
+    sessionId: string | undefined,
+    tripId: string | undefined,
+    dayId?: string,
+  ): Promise<TransitFillResult> {
+    const project = await this.require(sessionId, tripId)
+    const scenario = project.scenarios.find((entry) => entry.id === project.activeScenarioId)
+    const days = scenario?.days ?? []
+    if (dayId !== undefined && !days.some((day) => day.id === dayId)) {
+      throw new TripStoreError('TRIP_NOT_FOUND', `第 ${dayId} 天不存在。`)
+    }
+    const targets = days.filter((day) => isTransitFillDay(day) && (dayId === undefined || day.id === dayId))
+    if (dayId !== undefined && targets.length === 0) {
+      // One day was named and it does not need filling: say that, rather than
+      // answering an explicit question with an empty batch.
+      return {
+        planned: 0,
+        skipped: 1,
+        days: [{ dayId, planned: false, polyline: false, reason: '这一天已经记录了转场或里程，无需补全' }],
+      }
+    }
+    const results: TransitFillDayResult[] = []
+    let planned = 0
+    for (const day of targets) {
+      const outcome = await this.fillDayTransit(sessionId, project, day)
+      if (outcome.planned) planned += 1
+      results.push(outcome)
+    }
+    return { planned, skipped: results.length - planned, days: results }
+  }
+
+  /**
+   * Plan and write the one transit one day is missing.
+   *
+   * @param sessionId - session whose workspace owns the trip.
+   * @param project - trip the day belongs to.
+   * @param day - day whose title claims an unrecorded hop.
+   * @returns what happened, with a reason when nothing could be planned.
+   */
+  private async fillDayTransit(
+    sessionId: string | undefined,
+    project: TripProject,
+    day: TripDay,
+  ): Promise<TransitFillDayResult> {
+    const claimed = parseTransferTitle(day.title)
+    if (claimed.from === undefined || claimed.to === undefined || claimed.from === claimed.to) {
+      return { dayId: day.id, planned: false, polyline: false, reason: '标题里没有解析出两个不同的起终点名称' }
+    }
+    const restKey = await this.restKeyOrUndefined()
+    const hasKey = restKey !== undefined && restKey.trim() !== ''
+    if (!hasKey && this.amap === undefined) {
+      return { dayId: day.id, planned: false, polyline: false, reason: NO_PROVIDER_REASON }
+    }
+    const from = await this.titleEnd(project, claimed.from)
+    const to = await this.titleEnd(project, claimed.to)
+    if (from.point === undefined || to.point === undefined) {
+      const missing = [from, to].filter((end) => end.point === undefined).map((end) => end.label)
+      return {
+        dayId: day.id,
+        planned: false,
+        polyline: false,
+        reason: hasKey
+          ? `地理编码没有找到「${missing.join('」「')}」的坐标`
+          : `端点只有名称，且没有可用的高德 Web 服务 Key（${missing.join('、')}）`,
+      }
+    }
+    const mode: TravelMode = project.preferences.preferredModes[0] ?? 'driving'
+    let move: PlannedMove | undefined
+    try {
+      move = await this.planMove(from, to, mode, { allowStart: false, fallBackToCli: true })
+    } catch (error) {
+      return { dayId: day.id, planned: false, polyline: false, reason: messageOf(error) }
+    }
+    if (move === undefined) {
+      return { dayId: day.id, planned: false, polyline: false, reason: NO_PROVIDER_REASON }
+    }
+    // No clock is invented: a title states none, and the day's first stop is
+    // usually the arrival, not the departure.
+    const transit: TripTransit = {
+      id: nextTransitId(day),
+      from,
+      to,
+      mode,
+      ...move.distanceMeters === undefined ? {} : { distanceMeters: move.distanceMeters },
+      ...move.durationSeconds === undefined ? {} : { durationSeconds: move.durationSeconds },
+      ...move.tollsYuan === undefined ? {} : { tollsYuan: move.tollsYuan },
+      steps: move.steps,
+      freshness: 'fresh',
+      source: { provider: 'amap-cli', fetchedAt: move.fetchedAt },
+      ...move.polyline === undefined ? {} : { polyline: move.polyline },
+    }
+    const application = await this.patch(sessionId, project.id, [{ kind: 'set-day-transit', dayId: day.id, transit }])
+    // `changed` is what says the document holds the transit now; a rejected op
+    // leaves the project untouched, and reporting it as planned would show the
+    // panel a route that no reader can find in the store.
+    if (!application.outcome.changed) {
+      const rejection = application.outcome.rejected[0]
+      return {
+        dayId: day.id,
+        planned: false,
+        polyline: false,
+        reason:
+          rejection === undefined
+            ? '补全结果被校验拒绝'
+            : `补全结果被校验拒绝：${rejection.reason}`,
+      }
+    }
+    return {
+      dayId: day.id,
+      planned: true,
+      ...move.distanceMeters === undefined ? {} : { distanceMeters: move.distanceMeters },
+      ...move.durationSeconds === undefined ? {} : { durationSeconds: move.durationSeconds },
+      polyline: move.polyline !== undefined,
+    }
+  }
+
+  /**
+   * Turn one name from a day title into an end.
+   *
+   * A library place with exactly that name is the best answer — it already
+   * carries a coordinate and a photo. Otherwise the name is geocoded, which is
+   * what makes a day of nothing but 「西安 → 成都」 drawable.
+   *
+   * @param project - trip project owning the library.
+   * @param label - the name as the title writes it.
+   * @returns the end, located when either step could locate it.
+   */
+  private async titleEnd(project: TripProject, label: string): Promise<ResolvedTransitEnd> {
+    const place = Object.values(project.places).find((entry) => entry.name === label)
+    if (place !== undefined) return { placeId: place.id, label: place.name, point: place.point }
+    const point = await this.geocodeLabel(label, undefined)
+    return point === undefined ? { label } : { label, point }
   }
 
   /**
@@ -881,6 +1242,19 @@ export class TravelService {
  */
 export function attachAlerts(project: TripProject, alerts: readonly TripAlert[]): TripProject {
   return { ...project, alerts }
+}
+
+/**
+ * Readable message for a thrown value.
+ *
+ * A batch pass reports a failure as a reason rather than an exception, and the
+ * reason has to survive `unknown`.
+ *
+ * @param error - value caught from a provider call.
+ * @returns the error's message, or its string form when it is not an Error.
+ */
+function messageOf(error: unknown): string {
+  return error instanceof Error && error.message.trim() !== '' ? error.message : String(error)
 }
 
 /**

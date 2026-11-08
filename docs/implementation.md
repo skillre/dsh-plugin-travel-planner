@@ -72,6 +72,8 @@
 - `GET  /health` → `{ ok, configured, missing, amap }`
 - `POST /patch` → `{ ok, changed, applied, rejected, violations, revision?, view? }`；revision 冲突返回 409 `REVISION_MISMATCH`
 - `POST /focus` → `{ ok, center }`
+- `POST /rebuild-legs` → `{ ok, checked, updated, … }`；按天重算已有交通段
+- `POST /fill-transits` → `{ ok, planned, skipped, days }`；把「标题声明跨城、当天没有转场」的赶路日批量规划成转场并落盘（请求 `{ sessionId?, tripId?, dayId? }`，省略 `dayId` 即全部天）。走 Web 服务 `/v5/direction/driving`，没有 Key 时才退到 CLI，且**不允许**隐式启动高德容器（容器未运行则该天给出 reason）。
 
 同源校验：请求带 `Origin` 时必须与 `Host` 同源；JSON 边界只传最小数据。
 

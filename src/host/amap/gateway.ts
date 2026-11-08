@@ -213,13 +213,20 @@ export class AmapGateway {
    * Plan one route through the CLI, with a bounded cache.
    * @param input - route parameters.
    * @param signal - caller cancellation.
+   * @param options - whether a cold container may be started (default yes). A
+   *   batch pass that must never open the AMap window passes `allowStart: false`
+   *   and takes the `AMAP_NOT_RUNNING` error instead.
    * @returns the route facts.
    */
-  async planRoute(input: GatewayRouteInput, signal?: AbortSignal): Promise<RouteFact> {
+  async planRoute(
+    input: GatewayRouteInput,
+    signal?: AbortSignal,
+    options: { readonly allowStart?: boolean } = {},
+  ): Promise<RouteFact> {
     const key = routeCacheKey(input)
     const cached = this.readCache<RouteFact>(key)
     if (cached !== undefined) return { ...cached, fromCache: true }
-    await this.ensureReady(signal)
+    await this.ensureReady(signal, options)
     const raw = parseRoute(await this.run(routeArgs(input), { signal, cacheable: false }))
     const fetchedAt = new Date(this.now()).toISOString()
     const leg: RouteLeg = normalizeRouteLeg(raw, {

@@ -139,6 +139,12 @@ const PIN_NAME_ZOOM = 6
 /** At or below this many stops the names are drawn whatever the zoom is. */
 const PIN_NAME_MAX_STOPS = 10
 
+/** How close the map comes to a place the reader picked, when it is further out. */
+const FOCUS_ZOOM = 14
+
+/** 地图左下角那句话：点位与三种线型各自是什么意思。 */
+const MAP_LEGEND = '点位为真实坐标 · 细虚线=当天顺序 · 实线=已规划路线 · 长虚线=按标题估算'
+
 /** Local UI preferences; never written into the versioned trip document. */
 const UI_PREF_KEY = 'skillre-travel:ui'
 
@@ -314,6 +320,35 @@ function TravelBody(props: BodyProps): ReactElement {
     [props.sessionId, state, view],
   )
 
+  const onFillTransits = useCallback(
+    async (dayId?: string): Promise<{ readonly planned: number; readonly skipped: number }> => {
+      if (view === undefined || view.headline === null) return { planned: 0, skipped: 0 }
+      const response = await fetch(`${apiPath()}/fill-transits`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: props.sessionId,
+          tripId: view.headline.tripId,
+          // 不带 dayId 就是「把所有只有标题的赶路日都补上」，正是面板那一个按钮的意思。
+          ...dayId === undefined ? {} : { dayId },
+        }),
+      })
+      // 老宿主没有这条路由，回答的是一页 HTML 而不是 JSON：解析失败会落到下面的
+      // `payload.ok !== true`，按钮位置显示一句「补全路线失败。」——页面照常可用，
+      // 不会整块报错，也不会假装补全成功。
+      const payload = (await response.json().catch(() => ({}))) as {
+        readonly ok?: boolean
+        readonly planned?: number
+        readonly skipped?: number
+        readonly error?: string
+      }
+      if (payload.ok !== true) throw new Error(payload.error ?? '补全路线失败。')
+      await state.refresh()
+      return { planned: payload.planned ?? 0, skipped: payload.skipped ?? 0 }
+    },
+    [props.sessionId, state, view],
+  )
+
   const onRefreshPlaces = useCallback(
     async (placeId?: string, start = false): Promise<{ readonly checked: number; readonly updated: number; readonly needsStart: boolean }> => {
       if (view === undefined || view.headline === null) return { checked: 0, updated: 0, needsStart: false }
@@ -386,6 +421,7 @@ function TravelBody(props: BodyProps): ReactElement {
     onAskAgent,
     onReorder,
     onRebuildLegs,
+    onFillTransits,
     onRefreshPlaces,
     error: state.error,
   })
@@ -409,6 +445,13 @@ export interface TravelPanelProps {
   readonly onReorder: (dayId: string, order: readonly string[]) => Promise<void>
   /** Recompute one day's transport through the AMap CLI; resolves with the leg count. */
   readonly onRebuildLegs: (dayId: string) => Promise<number>
+  /**
+   * 把「只有标题」的赶路日交给高德规划并落盘；不带 `dayId` 就是全部。
+   *
+   * 可选，因为客户端与宿主的升级不同步：老宿主没有这条路由，此时面板不显示入口，
+   * 而不是给出一个必然失败的按钮。
+   */
+  readonly onFillTransits?: ((dayId?: string) => Promise<{ readonly planned: number; readonly skipped: number }>) | undefined
   /**
    * Look up missing photos and contact details, for the whole library or one
    * place. `start` is the caller's explicit consent to open the AMap window
@@ -478,11 +521,32 @@ export function TravelPanel(props: TravelPanelProps): ReactElement {
     [],
   )
 
+  /**
+   * One click for every day that only states its hop.
+   *
+   * 走的是宿主自己的路由，不经过模型：五天就是五次手动操作，那正是这个按钮要省掉的。
+   * 结果用面板既有的 notice 机制报出来，进行中则由 busy 挡住第二次点击。
+   */
+  const fillTransits = useCallback((): void => {
+    const fill = props.onFillTransits
+    if (fill === undefined) return
+    void run(async () => {
+      const result = await fill()
+      setNotice(fillReport(result.planned, result.skipped))
+    })
+  }, [props.onFillTransits, run])
+
   const headline = view.headline
   if (headline === null) return panelShell(true, createElement('div', { className: 'trv-empty' }, '还没有旅行项目'))
 
   const days = view.days
   const transfers = useMemo(() => buildTransfers(days), [days])
+  // 只有标题的赶路日：标题声明了跨城，当天既没有转场也没有一段算数的 leg。它们正是
+  // 「补全 N 天路线」要处理的那几天，按钮的 N 就是这里的长度。
+  const pendingFillDays = useMemo(
+    () => days.filter((day) => hasUnrecordedTransfer(day)).map((day) => day.id),
+    [days],
+  )
   const activeDay = days.find((day) => day.id === activeDayId) ?? todayIn(days) ?? days[0]
 
   const selectPlace = (placeId: string | undefined, itemId?: string): void => {
@@ -644,6 +708,9 @@ export function TravelPanel(props: TravelPanelProps): ReactElement {
                 onRange: setMapRange,
                 onTier: setMapTier,
                 selectedPlaceId,
+                pendingFillDays,
+                fillBusy: busy,
+                onFill: props.onFillTransits === undefined ? undefined : fillTransits,
                 onSelect: (placeId) => {
                   for (const entry of days) {
                     const item = entry.items.find((candidate) => candidate.placeId === placeId)
@@ -2375,6 +2442,15 @@ export function TripMap(props: {
   readonly onTier: (tier: MapTier) => void
   readonly selectedPlaceId: string | undefined
   readonly onSelect: (placeId: string) => void
+  /**
+   * 只有标题的赶路日，一次点击就能让高德把它们补成真实路线。
+   *
+   * 面板拿不到这个动作时（老宿主、或只是渲染地图做测试）不显示入口：按钮点不动比
+   * 没有按钮更糟。
+   */
+  readonly pendingFillDays?: readonly string[] | undefined
+  readonly onFill?: (() => void) | undefined
+  readonly fillBusy?: boolean | undefined
 }): ReactElement {
   const [failure, setFailure] = useState<string | undefined>(undefined)
   const [dragHeight, setDragHeight] = useState<number | undefined>(undefined)
@@ -2382,6 +2458,10 @@ export function TripMap(props: {
   const [box, setBox] = useState('0x0')
   /** Live zoom, so the marker names follow how much room the view has. */
   const [zoom, setZoom] = useState(0)
+  /** Flipped once the AMap instance exists, so a pick made while it loaded still lands. */
+  const [mapReady, setMapReady] = useState(false)
+  /** The place the map has already moved to, so a re-render cannot move it again. */
+  const focused = useRef<string | undefined>(undefined)
   const container = useRef<HTMLDivElement | null>(null)
   const instance = useRef<AmapMap | undefined>(undefined)
   const overlays = useRef<readonly unknown[]>([])
@@ -2391,6 +2471,9 @@ export function TripMap(props: {
   const fitted = useRef<string | undefined>(undefined)
 
   const groups = useMemo(() => buildGroups(props.days, props.day, props.range), [props.days, props.day, props.range])
+  // 赶路日的路线，本轮新增的主角。它同时喂给真图、示意图和图例，所以只算一次。
+  const routes = useMemo(() => drawnRoutesOf(groups, props.days), [groups, props.days])
+  const pendingFill = props.pendingFillDays ?? []
   const key = props.map.key
   const version = props.map.version
   const enabled = props.map.enabled && key !== undefined && failure === undefined
@@ -2417,6 +2500,7 @@ export function TripMap(props: {
         if (created !== undefined) {
           created.on('zoomend', () => setZoom(created.getZoom()))
           setZoom(created.getZoom())
+          setMapReady(true)
         }
       })
       .catch((error: unknown) => {
@@ -2429,6 +2513,8 @@ export function TripMap(props: {
       overlays.current = []
       // The next instance has never been fitted, whatever the previous one did.
       fitted.current = undefined
+      focused.current = undefined
+      setMapReady(false)
       map?.destroy()
     }
   }, [enabled, key, version])
@@ -2506,6 +2592,9 @@ export function TripMap(props: {
           for (const transit of day?.transits ?? []) {
             const path = transitPath(transit)
             if (path.length < 2) continue
+            // 这条线由下面那条 drive line 画（更粗、还带里程胶囊）：同一条路上再压一条
+            // 逐字重合的折线只是重复，fit 集合里也多一份同样的几何。
+            if (routeCovers(routes, group.dayId, path)) continue
             // Solid, unlike the dashed stop order: this is the road itself.
             const line = new namespace.Polyline({
               path,
@@ -2529,6 +2618,33 @@ export function TripMap(props: {
           })
           created.push(marker)
           byDay.set(end.dayId, [...(byDay.get(end.dayId) ?? []), marker])
+        }
+        // 赶路日的路线。实线是已经规划过的路，长虚线只是把标题里的里程画出来：两者
+        // 都比站点顺序的细虚线粗，一眼能分开。
+        for (const route of routes) {
+          const current = props.activeDayId === undefined || route.dayId === props.activeDayId
+          const estimated = route.kind === 'estimated'
+          const line = new namespace.Polyline({
+            path: route.path,
+            strokeColor: dayColor(route.colorIndex),
+            strokeWeight: estimated ? (current ? 4 : 3) : current ? 6 : 4,
+            strokeOpacity: emphasise ? (current ? 0.95 : 0.6) : 0.9,
+            strokeStyle: estimated ? 'dashed' : 'solid',
+            ...estimated ? { strokeDasharray: [14, 9] } : {},
+            zIndex: estimated ? (current ? 56 : 46) : current ? 58 : 48,
+          })
+          created.push(line)
+          // 路线进 byDay：当天模式与「聚焦当前天」要连整条路一起框住 —— 单站日过去
+          // 一条线都没有，正是这里补上的。
+          const routeMid = pathMidpoint(route.path)
+          const label = new namespace.Marker({
+            position: [routeMid[0], routeMid[1]] as const,
+            anchor: 'center',
+            zIndex: current ? 92 : 52,
+            content: driveLabelElement(route.label, dayColor(route.colorIndex), current ? 1 : 0.78),
+          })
+          created.push(line, label)
+          byDay.set(route.dayId, [...(byDay.get(route.dayId) ?? []), line, label])
         }
         for (const segment of buildRouteSegments(groups)) {
           const owner = groups[segment.dayIndex]
@@ -2563,7 +2679,38 @@ export function TripMap(props: {
     return () => {
       cancelled = true
     }
-  }, [enabled, key, version, groups, props.range, props.activeDayId, selectedPlaceId, onSelect, box])
+  }, [enabled, key, version, groups, routes, props.range, props.activeDayId, selectedPlaceId, onSelect, box])
+
+  /**
+   * Bring the picked place into view.
+   *
+   * Selection is what the reader did — clicking a stop card, or a place in the
+   * library — so the map answers it. The day emphasis that the scroll spy drives
+   * deliberately does not come through here: scrolling the itinerary must not
+   * move the map, which is what makes the map worth keeping on screen at all.
+   */
+  useEffect(() => {
+    const map = instance.current
+    if (map === undefined) return
+    const placeId = props.selectedPlaceId
+    if (placeId === undefined) {
+      focused.current = undefined
+      return
+    }
+    // One move per pick. The view is re-projected on every poll, so without this
+    // a selection would drag the map back to its place every few seconds.
+    if (focused.current === placeId) return
+    const point = focusPointFor(groups, placeId)
+    if (point === undefined) return
+    focused.current = placeId
+    // Keep a zoom the reader already chose; otherwise come in close enough to
+    // see which street the place is on.
+    map.setZoomAndCenter(
+      Math.max(map.getZoom(), FOCUS_ZOOM),
+      [point.longitude, point.latitude] as const,
+      false,
+    )
+  }, [props.selectedPlaceId, groups, mapReady])
 
   /** Zoom the map to the day the itinerary is showing. */
   const focusActiveDay = useCallback((): void => {
@@ -2601,6 +2748,7 @@ export function TripMap(props: {
       : createElement(MapSketch, {
           groups,
           days: props.days,
+          routes,
           range: props.range,
           selectedPlaceId,
           select: props.onSelect,
@@ -2645,12 +2793,30 @@ export function TripMap(props: {
         props.tier === 'full' ? '✕' : '⤢',
       ),
     ),
-    // No legend over the canvas: it covered the AMap attribution and repeated
-    // the day list below it, which is the map's key now — each rail row carries
-    // its day's colour.
-    totalStops === 0 || props.range === 'all'
+    // 图例说明线型，两种模式都留着：全程模式里每一条赶路路线同样需要解释，而
+    // 一条线都没有的空白图什么也不必说。
+    totalStops === 0 && routes.length === 0
       ? null
-      : createElement('div', { className: 'trv-map-note' }, '点位为真实坐标，虚线表示当天顺序'),
+      : createElement('div', { className: 'trv-map-note' }, MAP_LEGEND),
+    // 只有标题的赶路日：一次点击让高德把这一天补成真实路线，省掉「记为转场」再
+    // 「用高德重算」的两次操作。没有可补的日子就不出现。
+    pendingFill.length === 0 || props.onFill === undefined
+      ? null
+      : createElement(
+          'div',
+          { className: 'trv-map-fill' },
+          createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'trv-btn trv-btn-primary trv-map-fill-act',
+              disabled: props.fillBusy === true,
+              title: `只有标题的赶路日：${pendingFill.join('、')}`,
+              onClick: props.onFill,
+            },
+            props.fillBusy === true ? '补全中…' : `补全 ${String(pendingFill.length)} 天路线`,
+          ),
+        ),
     props.tier === 'full' && props.range === 'day' && props.day !== undefined
       ? createElement(
           'div',
@@ -2720,10 +2886,13 @@ function segment(label: string, active: boolean, onClick: () => void): ReactElem
  * @param days - Every day of the active scenario, in order.
  * @param day - The day currently in focus.
  * @param range - Whether to draw one day or the whole trip.
- * @returns One group per drawn day, in day order; days with no located stop are skipped.
+ * @returns One group per drawn day, in day order; days with nothing to draw are skipped.
  */
 export function buildGroups(days: readonly DayView[], day: DayView | undefined, range: MapRange): readonly DayStops[] {
   const source = range === 'all' ? days : day === undefined ? [] : [day]
+  // 一天只要有路可画就该进绘制集合：只有标题的赶路日没有站点、也没有转场端点，却是
+  // 最该看见的那一天。`driveRoutes` 只返回能画出来的路，所以这里不必再判点数。
+  const driven = new Set(driveRoutes(days).map((route) => route.dayId))
   const groups: DayStops[] = []
   for (const entry of source) {
     const stops = locateDay(entry)
@@ -2732,7 +2901,7 @@ export function buildGroups(days: readonly DayView[], day: DayView | undefined, 
     const locatedEnds = (entry.transits ?? []).some(
       (transit) => transit.from.point !== undefined || transit.to.point !== undefined,
     )
-    if (stops.length === 0 && !locatedEnds) continue
+    if (stops.length === 0 && !locatedEnds && !driven.has(entry.id)) continue
     groups.push({ dayId: entry.id, date: entry.date, dayOrder: days.indexOf(entry) + 1, stops })
   }
   return groups
@@ -2770,6 +2939,8 @@ export function buildRouteSegments(groups: readonly DayStops[]): readonly {
 function MapSketch(props: {
   readonly groups: readonly DayStops[]
   readonly days: readonly DayView[]
+  /** 赶路日的路线，与真图上画的是同一批：只有标题的那天在这里也必须看得见。 */
+  readonly routes: readonly DriveRoute[]
   readonly range: MapRange
   readonly selectedPlaceId: string | undefined
   readonly select: (placeId: string) => void
@@ -2790,7 +2961,7 @@ function MapSketch(props: {
   // The sketch has no zoom, so the names follow the same rule with zoom 0: they
   // appear when there are few enough stops to name.
   const labels = showPinNames(0, stops)
-  if (projected.length === 0 || (ends.length === 0 && stops === 0)) {
+  if (projected.length === 0 || (ends.length === 0 && stops === 0 && props.routes.length === 0)) {
     return createElement('div', { className: 'trv-map trv-map-empty' }, '这一天还没有带坐标的地点。')
   }
   return createElement(
@@ -2807,6 +2978,54 @@ function MapSketch(props: {
           className: 'trv-line',
           style: { stroke: dayColorCss((owner?.dayOrder ?? segment.dayIndex + 1) - 1) },
         })
+      }),
+      // 转场的折线：现在由下面的赶路路线画（更粗、带里程胶囊），这里只在路线没有覆盖
+      // 它的时候兜底，免得将来某条转场因为别的原因画不出来就整条消失。
+      ...props.days.flatMap((day) => {
+        const group = props.groups.find((entry) => entry.dayId === day.id)
+        if (group === undefined || bounds === undefined) return []
+        const colorIndex = group.dayOrder - 1
+        return (day.transits ?? []).flatMap((transit) => {
+          const path = transitPath(transit)
+          if (path.length < 2) return []
+          // 这条线已经由下面那条 trv-drive-line 画出来了（还有里程胶囊）：再画一条
+          // 逐字重合的折线只是重复。
+          if (routeCovers(props.routes, day.id, path)) return []
+          return [
+            createElement('polyline', {
+              key: `transit-${transit.id}`,
+              points: path
+                .map(([longitude, latitude]) => {
+                  const spot = bounds.project({ longitude, latitude })
+                  return `${String(spot.x)},${String(spot.y)}`
+                })
+                .join(' '),
+              className: 'trv-line trv-transit-line',
+              style: { stroke: dayColorCss(colorIndex) },
+            }),
+          ]
+        })
+      }),
+      // 赶路日的路线：同一套投影，所以一条路和它连着的站点一定对得上。实线是已经
+      // 规划过的路，长虚线只是标题里的里程 —— 两种线型在这里也必须一眼可分。
+      ...props.routes.flatMap((route) => {
+        if (bounds === undefined || route.path.length < 2) return []
+        return [
+          createElement('polyline', {
+            key: `drive-${route.id}`,
+            points: route.path
+              .map(([longitude, latitude]) => {
+                const spot = bounds.project({ longitude, latitude })
+                return `${String(spot.x)},${String(spot.y)}`
+              })
+              .join(' '),
+            className:
+              route.kind === 'estimated'
+                ? 'trv-line trv-drive-line trv-drive-line-estimated'
+                : 'trv-line trv-drive-line',
+            style: { stroke: dayColorCss(route.colorIndex) },
+          }),
+        ]
       }),
     ),
     createElement(
@@ -2853,6 +3072,28 @@ function MapSketch(props: {
             },
             title: `${end.role === 'from' ? '出发' : '抵达'}：${end.label}`,
           }),
+        ]
+      }),
+      // 路线胶囊压在路上：多点的路取累计长度的一半，标签才不会落在拐角上。
+      ...props.routes.flatMap((route) => {
+        const [longitude, latitude] = pathMidpoint(route.path)
+        const spot = bounds?.project({ longitude, latitude })
+        if (spot === undefined) return []
+        return [
+          createElement(
+            'div',
+            {
+              key: `drive-label-${route.id}`,
+              className: 'trv-drive-label',
+              style: {
+                left: `${String(spot.x)}%`,
+                top: `${String(spot.y)}%`,
+                ['--trv-pin']: dayColorCss(route.colorIndex),
+              },
+              title: route.label,
+            },
+            route.label,
+          ),
         ]
       }),
     ),
@@ -2912,6 +3153,26 @@ function endElement(title: string, color: string, opacity: number): HTMLElement 
 }
 
 /**
+ * One route's capsule on the AMap surface.
+ *
+ * 用 Marker 包一个 div（`anchor: 'center'`），路线平移缩放时胶囊自己跟着路走；显隐
+ * 沿用站点名字那一套（`.trv-map-labels .trv-drive-label`），所以缩放不需要重建覆盖物。
+ *
+ * @param text - the route's own line, e.g. `驾车 · ≈723 km · 按标题估算`.
+ * @param color - the day's colour, as the capsule's border.
+ * @param opacity - 1 for the day in view, less for the others.
+ * @returns the marker's DOM node.
+ */
+function driveLabelElement(text: string, color: string, opacity: number): HTMLElement {
+  const element = document.createElement('div')
+  element.className = 'trv-drive-label'
+  element.style.setProperty('--trv-pin', color)
+  element.style.opacity = String(opacity)
+  element.textContent = text
+  return element
+}
+
+/**
  * What the current fit describes: the drawn set and the box it is drawn in.
  *
  * The box belongs in the key because a 2.8:1 canvas and an 0.8:1 canvas fitted
@@ -2927,9 +3188,29 @@ function endElement(title: string, color: string, opacity: number): HTMLElement 
 export function fitKeyOf(range: MapRange, groups: readonly DayStops[], days: readonly DayView[], box: string): string {
   // Stops alone are not what is drawn: a transit whose ends gained coordinates
   // (a refreshed place, say) changes the picture without changing a stop count.
+  // 路线也一样：给一条 stale 转场补上真实 polyline（或「补全 N 天路线」之后）会把这条
+  // 路整个改写，而站点数、端点数都不变 —— 那时地图必须把新的路重新装进画面。
+  const routes = drawnRoutesOf(groups, days)
+    .map((route) => `${route.id}:${route.kind}:${routeSpan(route)}`)
+    .join(',')
   return `${range}|${groups
     .map((group) => `${group.dayId}:${String(group.stops.length)}`)
-    .join(',')}|${String(transitEnds(groups, days).length)}|${box}`
+    .join(',')}|${String(transitEnds(groups, days).length)}|${routes}|${box}`
+}
+
+/**
+ * A route's geometry, small enough for a comparison key.
+ *
+ * 点数抓「两点直连变成了真实路径」，首尾点抓「点数一样但路改了」——这两种都要求
+ * 重新 fit，而任何一种都不会改变站点数量。
+ *
+ * @param route - the drawn route.
+ * @returns point count plus the rounded first and last coordinate.
+ */
+function routeSpan(route: DriveRoute): string {
+  const spot = (point: readonly [number, number] | undefined): string =>
+    point === undefined ? '' : `${point[0].toFixed(3)},${point[1].toFixed(3)}`
+  return `${String(route.path.length)}@${spot(route.path[0])}~${spot(route.path[route.path.length - 1])}`
 }
 
 /**
@@ -2990,6 +3271,29 @@ export function transitEnds(
     }
   }
   return ends
+}
+
+/**
+ * Where the map should look to show one place.
+ *
+ * Only places the map is actually drawing are returned: a stop of another day
+ * while a single day is on screen has no marker to move to, and centring on a
+ * coordinate nothing is drawn at is just a jump into empty country.
+ *
+ * @param groups - the days being drawn, in day order.
+ * @param placeId - the place the reader picked.
+ * @returns its coordinate, or undefined when it is not on the map.
+ */
+export function focusPointFor(
+  groups: readonly DayStops[],
+  placeId: string | undefined,
+): { readonly longitude: number; readonly latitude: number } | undefined {
+  if (placeId === undefined) return undefined
+  for (const group of groups) {
+    const stop = group.stops.find((entry) => entry.placeId === placeId)
+    if (stop !== undefined) return stop.point
+  }
+  return undefined
 }
 
 /**
@@ -3174,6 +3478,11 @@ function boundsOf(groups: readonly DayStops[], days: readonly DayView[]): Sketch
   const all = [
     ...groups.flatMap((group) => group.stops).map((stop) => stop.point),
     ...transitEnds(groups, days).map((end) => end.point),
+    // 借相邻天的站点估出来的那条路，端点不一定在任何被画出的站点上：包围盒自己
+    // 把它算进去，否则线会被裁在框外。
+    ...drawnRoutesOf(groups, days).flatMap((route) =>
+      route.path.map(([longitude, latitude]) => ({ longitude, latitude })),
+    ),
   ]
   const first = all[0] ?? { longitude: 0, latitude: 0 }
   const longitudes = all.map((point) => point.longitude)
@@ -3305,6 +3614,15 @@ export interface DayTransfer {
   readonly toDayId: string
   readonly origin: string
   readonly destination: string
+  /**
+   * The stops the hop leaves from and arrives at, when the trip has them.
+   *
+   * The names above usually come from the day's title (`西安 → 成都`), while these
+   * are the places the traveller was actually at: promoted into a transit, they
+   * are what gives the road a coordinate to be drawn between.
+   */
+  readonly fromPlaceId?: string
+  readonly toPlaceId?: string
   /** Travel mode of a recorded leg, when there is one. */
   readonly mode: LegView['mode'] | undefined
   readonly distanceMeters: number | undefined
@@ -3413,6 +3731,8 @@ export function buildTransfers(days: readonly DayView[]): readonly DayTransfer[]
       toDayId: to.id,
       origin: parsed.origin ?? lastFrom?.name ?? from.title,
       destination: parsed.destination ?? firstTo?.name ?? to.title,
+      ...lastFrom === undefined ? {} : { fromPlaceId: lastFrom.placeId },
+      ...firstTo === undefined ? {} : { toPlaceId: firstTo.placeId },
       mode: chosen?.mode,
       distanceMeters: chosen?.distanceMeters ?? parsed.distanceMeters,
       durationSeconds: chosen?.durationSeconds,
@@ -3420,6 +3740,374 @@ export function buildTransfers(days: readonly DayView[]): readonly DayTransfer[]
     })
   }
   return transfers
+}
+
+/** 从这段里程起，一天算「在路上」而不是在城里逛。 */
+const LONG_DRIVE_METERS = 100_000
+
+/** 一段路要占掉当天里程或移动时间的这个比例，才算主导了这一天。 */
+const LONG_DRIVE_SHARE = 0.8
+
+/** A point as the map surfaces carry it: plain coordinates, no provider object. */
+interface LngLat {
+  readonly longitude: number
+  readonly latitude: number
+}
+
+/**
+ * One route the map draws as a road rather than as stop order.
+ *
+ * 转场、被一段长途主导的一天、以及只在标题里声明了跨城的赶路日，都会变成这样一条
+ * 线。`kind` 决定线型与语气：`planned` 是已经规划过的路，`estimated` 只是把标题里
+ * 的里程画出来 —— 地图上必须一眼分得开。
+ */
+export interface DriveRoute {
+  readonly id: string
+  readonly dayId: string
+  /** The day's position in the trip, so the road takes its day's colour. */
+  readonly colorIndex: number
+  readonly path: readonly (readonly [number, number])[]
+  /** Metres the route covers, when anything knows them. */
+  readonly meters?: number
+  readonly seconds?: number
+  readonly kind: 'planned' | 'estimated'
+  /** 胶囊上那行字，例如 `驾车 · 723 km · 8 小时 12 分`。 */
+  readonly label: string
+}
+
+/**
+ * The driving routes of a trip, one per day that has something to draw them with.
+ *
+ * 地图过去把「跨城赶路」和「市内挪窝」画成同一种细虚线，而且端点没有坐标时连那条
+ * 线都没有。这里按三级降级为每一天找出一条路：转场（有真实路径就画路径）、一段占
+ * 满当天的长途 leg、只剩标题时借相邻两天的站点。三级都无话可说的天不出现在结果里。
+ *
+ * Exported so the derivation is testable without a DOM.
+ *
+ * @param days - every day of the active scenario, in order.
+ * @returns one route per drawable day, in day order.
+ */
+export function driveRoutes(days: readonly DayView[]): readonly DriveRoute[] {
+  const routes: DriveRoute[] = []
+  // 相邻两天的兜底端点：只有真的需要用标题估一条路时才去算它。
+  let hops: readonly DayTransfer[] | undefined
+  for (const [colorIndex, day] of days.entries()) {
+    let count = 0
+    const add = (route: Omit<DriveRoute, 'id' | 'dayId' | 'colorIndex'>): void => {
+      count += 1
+      routes.push({ id: `${day.id}-drive-${String(count)}`, dayId: day.id, colorIndex, ...route })
+    }
+    let drawn = false
+    // 转场就是那天的路：有 polyline 用真实路径，否则两端直连。
+    for (const transit of day.transits ?? []) {
+      const path = transitPath(transit)
+      if (path.length < 2) continue
+      drawn = true
+      add({
+        path,
+        kind: 'planned',
+        label: driveLabel(transit.mode, transit.distanceMeters, transit.durationSeconds, false),
+        ...transit.distanceMeters === undefined ? {} : { meters: transit.distanceMeters },
+        ...transit.durationSeconds === undefined ? {} : { seconds: transit.durationSeconds },
+      })
+    }
+    // 转场已经给出这条路时到此为止：再降一级就会把同一条路画第二遍。
+    if (drawn) continue
+    // 没有转场，但一整天就是一段长途：它该被画成一条路，而不是「市内挪窝」。
+    const leg = dominantDriveLeg(day)
+    const legPath = leg === undefined ? [] : legPointPath(day, leg)
+    if (leg !== undefined && legPath.length >= 2) {
+      add({
+        path: legPath,
+        kind: 'planned',
+        label: driveLabel(leg.mode, leg.distanceMeters, leg.durationSeconds, false),
+        meters: leg.distanceMeters,
+        seconds: leg.durationSeconds,
+      })
+      continue
+    }
+    // 只有标题：里程是标题里的数字，坐标借相邻两天的站点 —— 整天在路上的一天本来
+    // 就没有站点，这正是它需要这条估算线的原因。
+    const stated = parseTransferTitle(day.title ?? '')
+    if (stated.origin === undefined && stated.destination === undefined) continue
+    if ((day.legs ?? []).some(usableLeg)) continue
+    const path = hopPath(days, day, (hops ??= buildTransfers(days)), stated)
+    if (path.length < 2) continue
+    add({
+      path,
+      kind: 'estimated',
+      label: driveLabel('driving', stated.distanceMeters, undefined, true),
+      ...stated.distanceMeters === undefined ? {} : { meters: stated.distanceMeters },
+    })
+  }
+  return routes
+}
+
+/**
+ * The routes of the days one drawing actually covers.
+ *
+ * @param groups - the days being drawn, in day order.
+ * @param days - every day of the trip, for their routes.
+ * @returns the routes whose day is in the drawn set.
+ */
+function drawnRoutesOf(groups: readonly DayStops[], days: readonly DayView[]): readonly DriveRoute[] {
+  return driveRoutes(days).filter((route) => groups.some((group) => group.dayId === route.dayId))
+}
+
+/**
+ * Whether one of the drawn routes already draws this line.
+ *
+ * 转场现在由 `driveRoutes` 画成带胶囊的路线，两侧各再画一条旧的转场折线就是同一条路
+ * 叠两遍 —— 判断「路径逐点相同」而不是「这一天有路线」，是因为一天可以有多段转场，
+ * 而路线是逐段对应的。
+ *
+ * @param routes - the routes being drawn.
+ * @param dayId - the day the polyline belongs to.
+ * @param path - the polyline's coordinates.
+ * @returns true when a route already covers it, so the old line is a duplicate.
+ */
+function routeCovers(routes: readonly DriveRoute[], dayId: string, path: readonly (readonly [number, number])[]): boolean {
+  return routes.some(
+    (route) =>
+      route.dayId === dayId &&
+      route.path.length === path.length &&
+      route.path.every(([longitude, latitude], index) => path[index]?.[0] === longitude && path[index]?.[1] === latitude),
+  )
+}
+
+/**
+ * The leg that makes a day a driving day.
+ *
+ * 一段路至少 100 km，且占当天**里程**或**移动时长**的 80% 以上，就算它主导了这一天。
+ * 两个口径是必须的：真实行程里「丽江 → 大理 175km」那天后面还跟着 13km 的市内挪窝，
+ * 175km 占里程 93%、却只占时间 77%，只按时间判就会把这条 175km 的路漏掉；反过来，
+ * 市内几站之间的十几公里也永远不会因为「占满了时间」而被当成赶路（里程不到 100km）。
+ *
+ * @param day - day to judge.
+ * @returns the dominant leg, or undefined when no single road owns the day.
+ */
+function dominantDriveLeg(day: DayView): LegView | undefined {
+  const legs = day.legs ?? []
+  const moving = legs.reduce((total, leg) => total + leg.durationSeconds, 0)
+  const travelled = legs.reduce((total, leg) => total + leg.distanceMeters, 0)
+  if (moving <= 0 && travelled <= 0) return undefined
+  const longest = legs.reduce<LegView | undefined>(
+    (best, leg) => (best === undefined || leg.distanceMeters > best.distanceMeters ? leg : best),
+    undefined,
+  )
+  if (longest === undefined || longest.distanceMeters < LONG_DRIVE_METERS) return undefined
+  const byDistance = travelled > 0 && longest.distanceMeters >= travelled * LONG_DRIVE_SHARE
+  const byTime = moving > 0 && longest.durationSeconds >= moving * LONG_DRIVE_SHARE
+  return byDistance || byTime ? longest : undefined
+}
+
+/** The coordinates of a leg's two stops; no coordinate on either end means no line. */
+function legPointPath(day: DayView, leg: LegView): readonly (readonly [number, number])[] {
+  const from = (day.items ?? []).find((item) => item.id === leg.fromItemId)?.point
+  const to = (day.items ?? []).find((item) => item.id === leg.toItemId)?.point
+  return from === undefined || to === undefined
+    ? []
+    : [
+        [from.longitude, from.latitude],
+        [to.longitude, to.latitude],
+      ]
+}
+
+/**
+ * The two ends of a hop that exists only in a title.
+ *
+ * 端点按四级降级找：标题里的地名先在整个行程的「有名字的坐标点」里对号入座（同名取
+ * 离这一天最近的那个）；对不上就用 `buildTransfers` 已算出的出发地与目的地；再对不上
+ * 就借相邻天 —— 出发点向**前**借（该天之前最后一个有坐标的站点），到达点向**后**借
+ * （该天之后第一个有坐标的站点）。行程首尾那两天没有邻天可借：这时退回整个行程的第一
+ * 个／最后一个有坐标站点，只要两端不重合就算一条估算线 —— 末位那天整天赶路、一个站点
+ * 都没有，过去正是在这里返回空，面板于是回答「这一天还没有带坐标的地点」。
+ *
+ * @param days - every day of the trip, in order.
+ * @param day - the day whose title claims the hop.
+ * @param hops - the derived cross-day rows of the same trip.
+ * @param stated - the two place names and the distance read out of the day's title.
+ * @returns the two ends, or nothing when the trip has no second located point.
+ */
+function hopPath(
+  days: readonly DayView[],
+  day: DayView,
+  hops: readonly DayTransfer[],
+  stated: { readonly origin?: string | undefined; readonly destination?: string | undefined },
+): readonly (readonly [number, number])[] {
+  const index = days.findIndex((entry) => entry.id === day.id)
+  const hop = hops.find((entry) => entry.toDayId === day.id)
+  const named = namedPoints(days)
+  // 两端各按优先级排一列候选：前两个是「说得清」的（标题里的地名、转场记下的地点），
+  // 后两个是「借来的」（相邻天、乃至整个行程的首尾）。
+  const from =
+    matchNamed(named, stated.origin, index) ??
+    pointOfPlace(days, hop?.fromPlaceId) ??
+    lastLocatedPoint(days, index - 1) ??
+    firstLocatedPoint(days, 0)
+  if (from === undefined) return []
+  // 到达点取第一个「与出发点不同」的候选：两端重合的「路」只是一条看不见的线，
+  // 与其画它，不如退到行程另一端 —— 只要行程里还有第二个有坐标的点。
+  const to = [
+    matchNamed(named, stated.destination, index),
+    pointOfPlace(days, hop?.toPlaceId),
+    firstLocatedPoint(days, index),
+    lastLocatedPoint(days, days.length - 1),
+    firstLocatedPoint(days, 0),
+  ].find((candidate) => candidate !== undefined && !samePoint(candidate, from))
+  if (to === undefined) return []
+  return [
+    [from.longitude, from.latitude],
+    [to.longitude, to.latitude],
+  ]
+}
+
+/** Whether two coordinates are the same place, at the precision the map works in. */
+function samePoint(left: LngLat, right: LngLat): boolean {
+  return Math.abs(left.longitude - right.longitude) < 1e-6 && Math.abs(left.latitude - right.latitude) < 1e-6
+}
+
+/** One named place the trip knows a coordinate for: a stop, or a transit end. */
+interface NamedPoint {
+  readonly name: string
+  /** The day it belongs to, so a name shared by several days can be matched to the nearest. */
+  readonly dayIndex: number
+  readonly point: LngLat
+}
+
+/**
+ * Every named place of the trip, with its coordinate.
+ *
+ * 标题只写「西安 → 成都」时，这两个名字与行程里的地点名／转场端点名对上，比借相邻天
+ * 的站点准得多（相邻天的站点可能只是「回民街」这类中途一站）。转场端点也是名字，
+ * 所以一并收进来。
+ *
+ * @param days - every day of the trip, in order.
+ * @returns one entry per located and named stop or transit end.
+ */
+function namedPoints(days: readonly DayView[]): readonly NamedPoint[] {
+  const points: NamedPoint[] = []
+  for (const [dayIndex, day] of days.entries()) {
+    for (const item of day.items ?? []) {
+      if (item.point !== undefined && item.name !== '') points.push({ name: item.name, dayIndex, point: item.point })
+    }
+    for (const transit of day.transits ?? []) {
+      for (const end of [transit.from, transit.to]) {
+        if (end.point !== undefined && end.label !== '') points.push({ name: end.label, dayIndex, point: end.point })
+      }
+    }
+  }
+  return points
+}
+
+/**
+ * The coordinate of a place name the day's title states.
+ *
+ * @param points - the trip's named places.
+ * @param name - the name read out of the title.
+ * @param index - the day the name was stated on; ties go to the nearest day.
+ * @returns the coordinate, or undefined when nothing in the trip is called that.
+ */
+function matchNamed(points: readonly NamedPoint[], name: string | undefined, index: number): LngLat | undefined {
+  if (name === undefined || name === '') return undefined
+  let best: NamedPoint | undefined
+  for (const entry of points) {
+    if (entry.name !== name) continue
+    if (best === undefined || Math.abs(entry.dayIndex - index) < Math.abs(best.dayIndex - index)) best = entry
+  }
+  return best?.point
+}
+
+/** One place's coordinate, looked up by id across the whole trip. */
+function pointOfPlace(days: readonly DayView[], placeId: string | undefined): LngLat | undefined {
+  if (placeId === undefined) return undefined
+  for (const day of days) {
+    const item = (day.items ?? []).find((entry) => entry.placeId === placeId)
+    if (item?.point !== undefined) return item.point
+  }
+  return undefined
+}
+
+/** The first located stop on or after one day, so a driving day can borrow one. */
+function firstLocatedPoint(days: readonly DayView[], fromIndex: number): LngLat | undefined {
+  for (let index = Math.max(fromIndex, 0); index < days.length; index += 1) {
+    const first = locateDay(days[index])[0]
+    if (first !== undefined) return first.point
+  }
+  return undefined
+}
+
+/** The last located stop on or before one day. */
+function lastLocatedPoint(days: readonly DayView[], fromIndex: number): LngLat | undefined {
+  for (let index = Math.min(fromIndex, days.length - 1); index >= 0; index -= 1) {
+    const located = locateDay(days[index])
+    const last = located[located.length - 1]
+    if (last !== undefined) return last.point
+  }
+  return undefined
+}
+
+/**
+ * The words on a route's capsule.
+ *
+ * 已规划的一天报真实数字；只有标题的一天没有时长可报，就用 `≈` 和「按标题估算」把
+ * 「这是估算」写清楚，读者不必去猜哪个数字是真的。
+ *
+ * @param mode - travel mode, absent for a route only a title states.
+ * @param meters - distance the route covers.
+ * @param seconds - time it takes, when anything measured it.
+ * @param estimated - true when the numbers are only the title's claim.
+ * @returns one line, e.g. `驾车 · ≈723 km · 按标题估算`.
+ */
+function driveLabel(
+  mode: LegView['mode'] | undefined,
+  meters: number | undefined,
+  seconds: number | undefined,
+  estimated: boolean,
+): string {
+  const parts = [modeLabel(mode ?? 'driving')]
+  if (meters !== undefined) parts.push(`${estimated ? '≈' : ''}${formatDistance(meters)}`)
+  if (seconds !== undefined) parts.push(formatDuration(seconds))
+  if (estimated) parts.push('按标题估算')
+  return parts.join(' · ')
+}
+
+/** Euclidean length of one step of a path, in degrees: enough to place a label. */
+function pathStep(from: readonly [number, number], to: readonly [number, number]): number {
+  return Math.hypot(to[0] - from[0], to[1] - from[1])
+}
+
+/**
+ * The point halfway along a path, measured by distance rather than by index.
+ *
+ * 胶囊要压在路上：一条先向南再向东的路，按下标取中点会把标签放到拐角上。
+ *
+ * @param path - ordered coordinates.
+ * @returns the coordinate halfway along the path.
+ */
+function pathMidpoint(path: readonly (readonly [number, number])[]): readonly [number, number] {
+  const first = path[0]
+  if (first === undefined) return [0, 0]
+  let total = 0
+  for (let index = 1; index < path.length; index += 1) {
+    const previous = path[index - 1]
+    const current = path[index]
+    if (previous === undefined || current === undefined) continue
+    total += pathStep(previous, current)
+  }
+  let walked = 0
+  for (let index = 1; index < path.length; index += 1) {
+    const previous = path[index - 1]
+    const current = path[index]
+    if (previous === undefined || current === undefined) continue
+    const step = pathStep(previous, current)
+    if (walked + step >= total / 2) {
+      const ratio = step === 0 ? 0 : (total / 2 - walked) / step
+      return [previous[0] + (current[0] - previous[0]) * ratio, previous[1] + (current[1] - previous[1]) * ratio]
+    }
+    walked += step
+  }
+  return first
 }
 
 /** A day's own numbers, for its sticky header and its row in the day rail. */
@@ -3511,13 +4199,16 @@ export function dayHeadNumbers(day: DayView): string {
   const facts = dayFacts(day)
   const stated = parseTransferTitle(day.title).distanceMeters
   const parts: string[] = []
-  if (facts.driveSeconds > 0) parts.push(`行驶 ${formatDuration(facts.driveSeconds)}`)
+  if (facts.driveSeconds > 0) {
+    parts.push(`${facts.stops === 0 && facts.transitCount > 0 ? '在路上' : '行驶'} ${formatDuration(facts.driveSeconds)}`)
+  }
   // The title usually states the same figure in round numbers; printing both a
   // line apart is what made the header look like it was repeating itself. A
   // routed distance that disagrees with the title is worth saying out loud.
   const agrees = stated !== undefined && Math.abs(stated - facts.distanceMeters) <= Math.max(stated * 0.2, 5_000)
   if (facts.distanceMeters >= 1_000 && !agrees) parts.push(formatDistance(facts.distanceMeters))
-  parts.push(`${String(facts.stops)} 站`)
+  // A day spent driving has no stops, and 「0 站」 would read as a mistake.
+  if (facts.stops > 0) parts.push(`${String(facts.stops)} 站`)
   if (facts.dwellMinutes > 0) parts.push(`停留 ${formatMinutes(facts.dwellMinutes)}`)
   // 「转场」 is the word for a day that changes city; the road itself is already
   // in the distance and the hours above it.
@@ -3575,8 +4266,8 @@ export function transitOpFromTransfer(dayId: string, transfer: DayTransfer): Rec
     dayId,
     transit: {
       id: `${dayId}-transit-1`,
-      from: { label: transfer.origin },
-      to: { label: transfer.destination },
+      from: { label: transfer.origin, ...transfer.fromPlaceId === undefined ? {} : { placeId: transfer.fromPlaceId } },
+      to: { label: transfer.destination, ...transfer.toPlaceId === undefined ? {} : { placeId: transfer.toPlaceId } },
       mode: transfer.mode ?? 'driving',
       ...transfer.distanceMeters === undefined ? {} : { distanceMeters: transfer.distanceMeters },
       ...transfer.durationSeconds === undefined ? {} : { durationSeconds: transfer.durationSeconds },
@@ -3605,6 +4296,25 @@ export function transferLines(transfer: DayTransfer): { readonly text: string; r
   if (transfer.distanceMeters !== undefined) parts.push(formatDistance(transfer.distanceMeters))
   if (transfer.durationSeconds !== undefined) parts.push(formatDuration(transfer.durationSeconds))
   return { text: parts.join(' · '), note: undefined }
+}
+
+/**
+ * What the panel says after a bulk route fill.
+ *
+ * 「跳过」也要说出来：宿主可能因为端点只有名字、没有可用的高德 Key 而跳过某几天，
+ * 一句「已补全 0 天」会让人以为是按钮坏了。
+ *
+ * @param planned - days the host turned into real routes.
+ * @param skipped - days it decided to leave alone.
+ * @returns the notice line.
+ */
+export function fillReport(planned: number, skipped: number): string {
+  if (planned === 0) {
+    return skipped === 0 ? '没有需要补全的路线。' : `没有补全任何路线，跳过 ${String(skipped)} 天。`
+  }
+  return skipped === 0
+    ? `已补全 ${String(planned)} 天路线。`
+    : `已补全 ${String(planned)} 天路线，跳过 ${String(skipped)} 天。`
 }
 
 /**
@@ -3762,6 +4472,18 @@ export const STYLES = `
 .trv-map-empty { display: grid; place-items: center; padding: 12px; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 11.5px; }
 .trv-map svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .trv-line { fill: none; stroke-width: .7; stroke-opacity: .55; stroke-dasharray: 2 1.6; }
+/* 转场过去在这里另画一条细实线；现在它由下面那条赶路路线来画（更粗、带里程胶囊），
+   旧的折线不再出现在任何一个面上，规则也随之删掉，免得留下一条没人用的 class。 */
+/* 赶路日的路线：比站点顺序的细虚线粗得多，实线是已经规划过的路。non-scaling-stroke
+   让线宽在 100×100 的拉伸坐标系里仍然是像素，横竖都看得清。 */
+.trv-line.trv-drive-line { stroke-width: 2.4; stroke-opacity: .92; stroke-dasharray: none; vector-effect: non-scaling-stroke; }
+/* 长虚线：只有标题里的那个里程，没有真实道路 —— 与实线一眼可分。 */
+.trv-line.trv-drive-line-estimated { stroke-width: 1.8; stroke-opacity: .85; stroke-dasharray: 7 4; vector-effect: non-scaling-stroke; }
+/* 路线胶囊：压在路上，跟着路一起缩放平移。真图一侧由 Marker 定位，示意图一侧是
+   绝对定位的 div，所以只有后者的位置来自这条规则。 */
+.trv-drive-label { display: none; white-space: nowrap; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--trv-pin, var(--dsw-alias-border-l1)); background: color-mix(in srgb, var(--dsw-alias-bg-overlay) 92%, transparent); color: var(--dsw-alias-label-primary); font-size: 10.5px; font-weight: 600; line-height: 1.6; font-variant-numeric: tabular-nums; box-shadow: 0 1px 3px rgb(0 0 0 / 20%); }
+.trv-map-labels .trv-drive-label { display: block; }
+.trv-map-marks .trv-drive-label { position: absolute; transform: translate(-50%, -50%); z-index: 3; }
 .trv-map-marks { position: absolute; inset: 0; }
 /* One marker: a teardrop pin — a coloured head with a tail that ends on the
    spot. The head is round and the tail takes the same colour through
@@ -3786,7 +4508,11 @@ export const STYLES = `
 .trv-seg-on { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font-weight: 600; }
 .trv-map-btn { appearance: none; width: 26px; height: 26px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: color-mix(in srgb, var(--dsw-alias-bg-overlay) 88%, transparent); color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; cursor: pointer; backdrop-filter: blur(6px); }
 .trv-map-btn:hover { background: var(--dsw-alias-bg-layer-2); }
-.trv-map-note { position: absolute; left: 8px; bottom: 8px; padding: 3px 8px; border-radius: 8px; background: color-mix(in srgb, var(--dsw-alias-bg-overlay) 80%, transparent); font-size: 10.5px; color: var(--dsw-alias-label-secondary); z-index: 2; }
+.trv-map-note { position: absolute; left: 8px; bottom: 8px; max-width: calc(100% - 132px); padding: 3px 8px; border-radius: 8px; background: color-mix(in srgb, var(--dsw-alias-bg-overlay) 80%, transparent); font-size: 10.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); z-index: 2; }
+/* 只有标题的赶路日：一次点击补全，不必每天点两次「重算」。放在地图右下角，与
+   左下的图例各占一边。 */
+.trv-map-fill { position: absolute; right: 8px; bottom: 8px; display: flex; align-items: center; gap: 6px; z-index: 3; }
+.trv-map-fill-act { padding: 3px 10px; font-size: 11.5px; }
 .trv-map-grip { position: absolute; left: 50%; bottom: 0; transform: translateX(-50%); width: 56px; height: 12px; cursor: ns-resize; z-index: 3; }
 .trv-map-grip::after { content: ''; position: absolute; left: 50%; top: 4px; transform: translateX(-50%); width: 34px; height: 4px; border-radius: 999px; background: var(--dsw-alias-border-l2); }
 .trv-map-strip { position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: 6px; padding: 8px; overflow-x: auto; background: linear-gradient(to top, color-mix(in srgb, var(--dsw-alias-bg-overlay) 94%, transparent), transparent); z-index: 2; }
@@ -3813,7 +4539,7 @@ export const STYLES = `
 .trv-transit-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .trv-transit-icon { font-size: 13px; }
 .trv-transit-route { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.trv-transit-meta { font-size: 11.5px; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
+.trv-transit-meta { font-size: 11.5px; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .trv-transit-actions { display: flex; align-items: center; gap: 6px; }
 .trv-transit-actions .trv-btn { padding: 3px 9px; font-size: 11.5px; }
 /* An end of a transit: a square, so a place the trip only left from or reached

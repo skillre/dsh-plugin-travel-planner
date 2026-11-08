@@ -120,20 +120,25 @@ export function buildTravelView(
 /**
  * Project one end of a transit.
  *
- * The label always exists; the coordinate only when the end points at a place
- * the library knows, which is what lets an endpoint be a city name and nothing
- * else.
+ * The label always exists; the coordinate comes from the library place when the
+ * end has one, and otherwise from the end's own point — the coordinate a
+ * geocode produced for a bare city name. That is what lets an endpoint be 「成都」
+ * and still be drawn.
  *
  * @param project - trip project owning the place library.
  * @param end - stored transit end.
  * @returns the browser-facing end.
  */
-function transitEnd(project: TripProject, end: { readonly placeId?: string; readonly label: string }): TransitEndView {
+function transitEnd(
+  project: TripProject,
+  end: { readonly placeId?: string; readonly label: string; readonly point?: GeoPoint },
+): TransitEndView {
   const place = end.placeId === undefined ? undefined : project.places[end.placeId]
+  const point = place?.point ?? end.point
   return {
     ...end.placeId === undefined ? {} : { placeId: end.placeId },
     label: place?.name ?? end.label,
-    ...place === undefined ? {} : { point: place.point },
+    ...point === undefined ? {} : { point },
   }
 }
 

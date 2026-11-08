@@ -913,6 +913,18 @@ function applySetDayTransit(project: TripProject, dayId: string, transit: TripTr
     if (end.placeId !== undefined && project.places[end.placeId] === undefined) {
       return failed(CODE_UNKNOWN_PLACE, `转场端点 ${end.placeId} 不在地点库里`)
     }
+    // A geocoded coordinate is ordinary end data, not a place: 「西安」 stays a
+    // name and gains the point its geocode produced. Only its range is checked,
+    // because a bad number is what would make the map draw nonsense.
+    if (end.point !== undefined) {
+      const { longitude, latitude } = end.point
+      if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+        return failed(CODE_INVALID_VALUE, '转场端点的经度必须在 -180..180 之间')
+      }
+      if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+        return failed(CODE_INVALID_VALUE, '转场端点的纬度必须在 -90..90 之间')
+      }
+    }
   }
   const labelOf = (end: { readonly placeId?: string; readonly label: string }): string =>
     end.label.trim() !== '' ? end.label.trim() : (end.placeId === undefined ? '' : (project.places[end.placeId]?.name ?? ''))
@@ -1164,7 +1176,14 @@ function shiftItemDate(item: ItineraryItem, from: string, to: string): Itinerary
  */
 function shiftTransitDate(transit: TripTransit, from: string, to: string): TripTransit {
   const departAt = replaceDatePrefix(transit.departAt, from, to)
-  const arriveAt = replaceDatePrefix(transit.arriveAt, from, to)
+  // A night drive arrives on the following date, and that date moves with the
+  // day it left: leaving it behind would put the arrival nine days away from the
+  // departure.
+  const arriveAt = replaceDatePrefix(
+    replaceDatePrefix(transit.arriveAt, dayAfter(from), dayAfter(to)),
+    from,
+    to,
+  )
   if (departAt === transit.departAt && arriveAt === transit.arriveAt) return transit
   const shifted: Mutable<TripTransit> = { ...transit }
   if (departAt === undefined) delete shifted.departAt
@@ -1209,6 +1228,11 @@ function parseCalendarDate(value: string): number | undefined {
  * @param milliseconds - Milliseconds at UTC midnight.
  * @returns The date text.
  */
+function dayAfter(date: string): string {
+  const parsed = Date.parse(`${date}T00:00:00Z`)
+  return Number.isFinite(parsed) ? formatCalendarDate(parsed + MILLISECONDS_PER_DAY) : date
+}
+
 function formatCalendarDate(milliseconds: number): string {
   return new Date(milliseconds).toISOString().slice(0, 10)
 }
@@ -1369,8 +1393,8 @@ function cloneDay(day: TripDay): TripDay {
 function cloneTransit(transit: TripTransit): TripTransit {
   return {
     ...transit,
-    from: { ...transit.from },
-    to: { ...transit.to },
+    from: { ...transit.from, ...transit.from.point === undefined ? {} : { point: { ...transit.from.point } } },
+    to: { ...transit.to, ...transit.to.point === undefined ? {} : { point: { ...transit.to.point } } },
     steps: transit.steps.map((step) => ({ ...step })),
     source: { ...transit.source },
   }

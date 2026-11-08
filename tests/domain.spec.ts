@@ -568,10 +568,105 @@ describe('validateTrip', () => {
     expect(missing[0]?.severity).toBe('info')
   })
 
+  it('counts a long-enough leg as the record even when it is short in distance', () => {
+    // The panel's `usableLeg` and the host fill pass use one rule — over a
+    // kilometre **or** over ten minutes — and this alert has to say the same
+    // thing, or the panel offers to fill a day the domain already accepted.
+    const project = makeProject({
+      scenarios: [
+        makeScenario('main', [
+          makeDay('day1', {
+            title: '西安 → 成都｜翻秦岭 723km',
+            items: [makeItem('a', 'p1'), makeItem('b', 'p2')],
+            legs: [
+              {
+                id: 'l1',
+                fromItemId: 'a',
+                toItemId: 'b',
+                mode: 'driving',
+                distanceMeters: 700,
+                durationSeconds: 900,
+                steps: [],
+                freshness: 'fresh',
+                source: { provider: 'amap-cli', fetchedAt: NOW },
+              },
+            ],
+          }),
+        ]),
+      ],
+      places: [makePlace('p1'), makePlace('p2')],
+    })
+
+    const missing = validateTrip(project, { now: NOW }).alerts.filter(
+      (entry) => entry.code === ALERT_CODES.missingTransit,
+    )
+
+    expect(missing).toEqual([])
+  })
+
+  it('still marks a day whose only leg is a placeholder', () => {
+    const project = makeProject({
+      scenarios: [
+        makeScenario('main', [
+          makeDay('day1', {
+            title: '西安 → 成都｜翻秦岭 723km',
+            items: [makeItem('a', 'p1'), makeItem('b', 'p2')],
+            legs: [
+              {
+                id: 'l1',
+                fromItemId: 'a',
+                toItemId: 'b',
+                mode: 'walking',
+                // Both thresholds under: what `travel_day_rebuild_legs` writes
+                // when two stops resolve to the same point. It must not hide the
+                // road the title states.
+                distanceMeters: 300,
+                durationSeconds: 240,
+                steps: [],
+                freshness: 'fresh',
+                source: { provider: 'amap-cli', fetchedAt: NOW },
+              },
+            ],
+          }),
+        ]),
+      ],
+      places: [makePlace('p1'), makePlace('p2')],
+    })
+
+    const missing = validateTrip(project, { now: NOW }).alerts.filter(
+      (entry) => entry.code === ALERT_CODES.missingTransit,
+    )
+
+    expect(missing).toHaveLength(1)
+    expect(missing[0]?.id).toBe('missing-transit:day1')
+  })
+
   it('only reads an arrow as a journey', () => {
     expect(claimsHop('西安 → 成都｜翻秦岭 723km')).toBe(true)
     expect(claimsHop('大理｜洱海完整一天')).toBe(false)
     expect(claimsHop('丽江 - 大理')).toBe(false)
+    // A clock range uses the same arrow and is a schedule, not a change of city.
+    expect(claimsHop('11:00 → 15:00 婚纱照拍摄')).toBe(false)
+    expect(claimsHop('08:30 → 12:00 洱海环湖')).toBe(false)
+  })
+
+  it('renders a driving day in the Markdown plan instead of calling it empty', () => {
+    const project = makeProject({
+      scenarios: [
+        makeScenario('main', [
+          makeDay('day1', {
+            title: '北京 → 西安｜赶路 1,077km',
+            transits: [makeTransit('t1', { distanceMeters: 1_077_000, durationSeconds: 45_480 })],
+          }),
+        ]),
+      ],
+    })
+
+    const markdown = renderTripMarkdown(project, {})
+
+    expect(markdown).toContain('西安 → 成都')
+    expect(markdown).toContain('1077')
+    expect(markdown).not.toContain('当天没有安排')
   })
 
   it('grades a long drive as a drive, not as an overloaded day', () => {
@@ -1257,6 +1352,80 @@ describe('applyTripPatch', () => {
     expect(nameless.rejected[0]?.code).toBe('INVALID_VALUE')
     expect(unknownDay.rejected[0]?.code).toBe('UNKNOWN_DAY')
     expect(missing.rejected[0]?.code).toBe('INVALID_VALUE')
+  })
+
+  it('keeps a geocoded coordinate on an end that is only a name', () => {
+    const point = { longitude: 108.93977, latitude: 34.341574, coordinateSystem: 'gcj02' as const }
+    const written = applyTripPatch(
+      baseProject,
+      [
+        {
+          kind: 'set-day-transit',
+          dayId: 'day1',
+          transit: makeTransit('t1', { from: { label: '西安', point }, to: { label: '成都' } }),
+        },
+      ],
+      { now: NOW },
+    )
+
+    // 「西安」 stays a name and gains the point its geocode produced: that pair is
+    // what lets the map draw a day with no stops on it.
+    expect(written.rejected).toEqual([])
+    expect(written.project.scenarios[0]?.days[0]?.transits?.[0]?.from).toEqual({ label: '西安', point })
+
+    const outOfRange = applyTripPatch(
+      baseProject,
+      [
+        {
+          kind: 'set-day-transit',
+          dayId: 'day1',
+          transit: makeTransit('t1', {
+            from: { label: '西安', point: { ...point, latitude: 120 } },
+            to: { label: '成都' },
+          }),
+        },
+      ],
+      { now: NOW },
+    )
+    expect(outOfRange.rejected[0]?.code).toBe('INVALID_VALUE')
+  })
+
+  it('writes the version it now carries, and moves a transit with its day', () => {
+    const v1 = { ...baseProject, schemaVersion: 1 as const }
+    const written = applyTripPatch(
+      v1 as unknown as TripProject,
+      [{ kind: 'set-day-transit', dayId: 'day1', transit: makeTransit('t1') }],
+      { now: NOW },
+    )
+
+    // The document now holds a field this build introduced, so it says so; a
+    // reader that only knows version 1 would otherwise trust a lie.
+    expect(written.project.schemaVersion).toBe(CURRENT_TRIP_SCHEMA_VERSION)
+
+    // A re-date takes the day's road with it: a transit whose clocks stay on the
+    // old date contradicts the day it sits under.
+    const moved = applyTripPatch(
+      makeProject({
+        scenarios: [
+          makeScenario('main', [
+            makeDay('day1', {
+              date: '2026-10-01',
+              transits: [makeTransit('t1', { departAt: '2026-10-01T06:00:00+08:00', arriveAt: '2026-10-02T04:30:00+08:00' })],
+            }),
+            makeDay('day2', { date: '2026-10-02' }),
+          ]),
+        ],
+        startDate: '2026-10-01',
+        endDate: '2026-10-02',
+      }),
+      [{ kind: 'set-trip-dates', startDate: '2026-10-10' }],
+      { now: NOW },
+    )
+    const day = moved.project.scenarios[0]?.days[0]
+    expect(day?.date).toBe('2026-10-10')
+    expect(day?.transits?.[0]?.departAt).toBe('2026-10-10T06:00:00+08:00')
+    // A night drive lands the next day, which moves with it.
+    expect(day?.transits?.[0]?.arriveAt).toBe('2026-10-11T04:30:00+08:00')
   })
 
   it('removes a day of the active scenario and reports an empty op list as unchanged', () => {

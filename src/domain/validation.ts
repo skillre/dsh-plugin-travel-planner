@@ -50,8 +50,24 @@ const DEFAULT_FACT_STALE_AFTER_MS = 24 * 60 * 60 * 1000
 /** Total time budget of one day before it counts as overloaded (10 hours). */
 const DAY_OVERLOAD_SECONDS = 10 * 60 * 60
 
-/** A leg this long is a journey between cities, not a walk between two stops. */
+/**
+ * Thresholds at which a leg records a real move: over a kilometre, or over ten
+ * minutes.
+ *
+ * One rule, three implementations: the panel's `usableLeg` (src/client/index.ts),
+ * the host fill pass's `recordsMove` (src/host/transit-fill.ts) and the one just
+ * below. They must stay synonyms. All three answer the same question — does this
+ * day already record its road? — and a disagreement shows up as a fill button
+ * offered for a day the domain already accepted, or a 「跨城交通未记录」 alert with
+ * nothing the user can do about it.
+ */
 const MIN_TRANSIT_METERS = 1_000
+const MIN_TRANSIT_SECONDS = 600
+
+/** Whether one leg records a real move rather than a two-stop placeholder. */
+function recordsMove(leg: RouteLeg): boolean {
+  return leg.distanceMeters >= MIN_TRANSIT_METERS || leg.durationSeconds >= MIN_TRANSIT_SECONDS
+}
 
 /** From this distance on, a day's time is the road's and not the itinerary's. */
 const DRIVE_FRAMING_METERS = 100_000
@@ -277,8 +293,10 @@ function collectMissingTransitAlerts(
 ): void {
   if (!claimsHop(day.title)) return
   if ((day.transits ?? []).length > 0) return
-  // A real leg between the day's own stops already records the move.
-  if (day.legs.some((leg) => leg.distanceMeters >= MIN_TRANSIT_METERS)) return
+  // A real leg between the day's own stops already records the move; a
+  // placeholder does not. The panel offers its fill button and the host fill
+  // pass decides the same way — see `recordsMove` above.
+  if (day.legs.some(recordsMove)) return
 
   sink.push({
     id: `missing-transit:${day.id}`,

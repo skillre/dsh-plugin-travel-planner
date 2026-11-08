@@ -217,3 +217,27 @@ export interface TripDay {
 - Markdown 导出的转场段落、`travel_itinerary_validate` 的转场专项检查。
 - 一天多段转场的编辑 UI（数据已支持，UI 只顺序渲染）。
 - 把 leg 与 transit 统一成同一张"移动图"（方案 C，另开一轮）。
+
+### 独立只读复核后的修正（同一轮，未发版）
+
+复核（只读，`npm test` 271 通过）报了 1 项 blocking + 4 项 important + 8 项 minor，逐条处理：
+
+| # | 问题 | 修正 |
+|---|---|---|
+| **B1** | **纯赶路日在图上完全不画**：`buildGroups` 会跳过"没有带坐标站点"的天，而"只有转场的那一天"正是最该画的那天（转场线、端点方块、单日视图全都空） | `buildGroups` 改为"有带坐标站点**或**有带坐标转场端点"即纳入；示意图的 `boundsOf` 把转场端点算进包围盒；端点方块对**任意一天**已画出的站点去重（跨天重复的端点不再叠一个方块）；示意图也补画转场实线（此前只有高德侧画） |
+| **I1** | 派生的 `arriveAt` 用 `toISOString()` 归一成 UTC，而面板是按文本切片读钟点的 → 06:00 出发 + 12.6 小时显示成「10:38 抵达」 | 新增 `addDuration()`：保持 `departAt` 的 offset 形状（`2026-10-01T18:38:00+08:00`）；`Z`/无 offset 的输入仍按 ISO 输出。原先固化 UTC 期望值的测试已改成真值 |
+| **I2** | 写入 v2 字段后文件 `schemaVersion` 仍是 1（与文档不符） | `applyTripPatch` 在**发生写入**时把 `schemaVersion` 提升为 `CURRENT_TRIP_SCHEMA_VERSION`；新增"v1 + 写入 → 版本变 2"的用例 |
+| **I3** | `set-trip-dates` 只搬 items 的时间，转场的 `departAt/arriveAt` 留在旧日期 | 新增 `shiftTransitDate()`；跨午夜的 `arriveAt` 连同"次日"一起顺延（`dayAfter()`） |
+| **I4** | 工具 `plan` 的默认值在描述里说反了 | 描述改为"默认会用高德规划（优先 Web 服务，否则 CLI），你传的里程/时长会被忽略；要保留就传 `plan: false`" |
+| M1 | Markdown 导出把只有转场的赶路日写成「当天没有安排」 | 导出为 `- 🚗 **驾车** 西安 → 成都 · 723 km · 758 min`，不再写空 |
+| M2 | `claimsHop` 把 `11:00 → 15:00 拍摄` 当成跨城 | 时间区间先判否；补了两条用例 |
+| M3 | `DayView.transits` 必填，但旧 Host 不产出该字段 | 改为可选，并在注释里写明为什么（两端更新不同步） |
+| M4 | 转场校验复用 `leg.steps` 的报错措辞 | `parseSteps` 接受 owner 前缀，转场报 `transit.steps` |
+| M5 | `fitKeyOf` 不含转场端点，端点拿到坐标后不重新 fit | 键里加入"未被站点覆盖的转场端点数"，签名带上 `days` |
+| M7 | 转场 id 用"条数+1"可能与已存在的 id 撞车并静默覆盖 | `nextTransitId()` 从现有 id 集合里找第一个空位 |
+| M8 | 纯赶路日天头写「0 站」；转场卡的元信息可能溢出 | 0 站不显示，改为「在路上 12 小时 36 分 · 1077 km · 转场」；元信息加 `overflow-wrap: anywhere` |
+| — | 迁移出来的转场没有坐标 → 画不出线 | `DayTransfer` 带上两端站点 id（前一天最后一站 / 当天第一站），`transitOpFromTransfer` 把它们写进端点：城市名仍给读者看，坐标给地图画路 |
+
+复核确认无问题的部分：`dayFacts`/`dayDistanceMeters`/`dayDistanceText`、`buildTransfers`/`hasUnrecordedTransfer` 的让位关系、`DAY_OVERLOADED` 的分流与计数、`collectRouteAlerts` 的 leg+transit 合并、告警 id、patch 的校验与深拷贝、`trip-store` 接受 [1,2]、`EMPTY_DAY` 放宽、天头/目录/`dayIntensity`、旧 Host 不崩。
+
+**版本**：0.11.4（本轮第三次重切，原因同前：包管理器按 spec 字符串判断新旧）。

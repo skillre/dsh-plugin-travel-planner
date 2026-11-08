@@ -65,7 +65,10 @@ export interface ItemView {
 export interface TransitEndView {
   readonly placeId?: string
   readonly label: string
-  /** Present when the end resolves to a library place. */
+  /**
+   * Present when the end can be located: a library place's coordinates, or —
+   * for an end that is only a name — the point the Host geocoded for it.
+   */
   readonly point?: GeoPoint
 }
 

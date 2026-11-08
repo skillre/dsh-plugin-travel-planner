@@ -3,6 +3,11 @@ lib/
 coverage/
 release-artifact/
 *.tgz
+
+# Skill evaluation scratch: research notes, fixtures, eval runs and verification
+# logs. Never packaged (`files` ships only `skills/travel-planner/`), and too big
+# and too volatile to belong in the history.
+skills/.build/
 .pnpm-store/
 .npm/
 .fleet/

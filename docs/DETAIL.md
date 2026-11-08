@@ -1,0 +1,1 @@
+![The Travel Planner workbench in the right sidebar: an itinerary view showing Day 2 in Xi'an as a three-stop timeline (Shaanxi History Museum, Giant Wild Goose Pagoda, then a 723 km transit to Chengdu), a map with the real route beside it, and the 13 model tools with deterministic alerts such as overlaps and stale routes on the right](preview.svg)

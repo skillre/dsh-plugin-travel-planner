@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="600" viewBox="0 0 1280 600">
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7FAFD"/>
+      <stop offset="1" stop-color="#EAF2F9"/>
+    </linearGradient>
+    <linearGradient id="hero" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F0F7FF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="600" fill="url(#ground)"/>
+  <circle cx="1206" cy="58" r="128" fill="#DCEBFA" opacity="0.6"/>
+  <circle cx="48" cy="574" r="100" fill="#E3EFFA" opacity="0.5"/>
+
+  <text x="56" y="58" font-family="sans-serif" font-size="14" fill="#7C93A8">DSH · a travel workbench in the right sidebar</text>
+  <text x="56" y="108" font-family="sans-serif" font-size="34" font-weight="700" fill="#16202B">Travel Planner</text>
+  <text x="56" y="140" font-family="sans-serif" font-size="14" fill="#5B7186">Real places and routes from AMap, turned into a structured day-by-day trip</text>
+
+  <rect x="56" y="172" width="392" height="336" rx="18" fill="url(#hero)" stroke="#CFE0F0" stroke-width="1.5"/>
+
+  <rect x="76" y="192" width="352" height="30" rx="8" fill="#EAF3FC"/>
+  <text x="90" y="212" font-family="sans-serif" font-size="12" fill="#4A739B">Itinerary</text>
+  <text x="146" y="212" font-family="sans-serif" font-size="12" fill="#9DB2C6">Map</text>
+  <text x="200" y="212" font-family="sans-serif" font-size="12" fill="#9DB2C6">Places</text>
+  <text x="254" y="212" font-family="sans-serif" font-size="12" fill="#9DB2C6">Alerts</text>
+
+  <text x="78" y="252" font-family="sans-serif" font-size="13" font-weight="700" fill="#16202B">Day 2 · Xi'an</text>
+  <text x="350" y="252" font-family="sans-serif" font-size="11" fill="#8FA6BA">3 stops</text>
+
+  <path d="M92 309 L92 405" stroke="#CFE0F0" stroke-width="1.6"/>
+  <circle cx="92" cy="309" r="5" fill="#2F7FC4"/>
+  <circle cx="92" cy="357" r="5" fill="#2F7FC4"/>
+  <circle cx="92" cy="405" r="5" fill="#E0A03C"/>
+
+  <text x="108" y="305" font-family="sans-serif" font-size="11" fill="#8FA6BA">09:00</text>
+  <rect x="108" y="292" width="308" height="34" rx="8" fill="#F7FBFF" stroke="#DCEAF7" stroke-width="1"/>
+  <text x="120" y="313" font-family="sans-serif" font-size="12" fill="#16202B">Shaanxi History Museum</text>
+  <text x="352" y="313" font-family="sans-serif" font-size="10" fill="#8FA6BA">2h</text>
+
+  <text x="108" y="353" font-family="sans-serif" font-size="11" fill="#8FA6BA">11:30</text>
+  <rect x="108" y="340" width="308" height="34" rx="8" fill="#F7FBFF" stroke="#DCEAF7" stroke-width="1"/>
+  <text x="120" y="361" font-family="sans-serif" font-size="12" fill="#16202B">Giant Wild Goose Pagoda</text>
+  <text x="352" y="361" font-family="sans-serif" font-size="10" fill="#8FA6BA">1.5h</text>
+
+  <text x="108" y="401" font-family="sans-serif" font-size="11" fill="#8FA6BA">14:00</text>
+  <rect x="108" y="388" width="308" height="34" rx="8" fill="#FFFBF2" stroke="#F0DFBE" stroke-width="1"/>
+  <text x="120" y="409" font-family="sans-serif" font-size="12" fill="#16202B">Transit → Chengdu</text>
+  <text x="322" y="409" font-family="sans-serif" font-size="10" fill="#B4883C">723km</text>
+
+  <text x="78" y="452" font-family="sans-serif" font-size="11" fill="#8FA6BA">Overlap · transit needs recalculating</text>
+  <rect x="78" y="462" width="128" height="26" rx="7" fill="#2F7FC4"/>
+  <text x="94" y="479" font-family="sans-serif" font-size="11" fill="#FFFFFF">Recalculate transit</text>
+
+  <text x="492" y="196" font-family="sans-serif" font-size="14" font-weight="700" fill="#16202B">Map · real routes</text>
+  <rect x="492" y="208" width="352" height="300" rx="14" fill="#EAF2F9" stroke="#CFE0F0" stroke-width="1.2"/>
+  <path d="M524 452 Q566 380 610 396 Q654 412 700 342 Q736 288 790 300" fill="none" stroke="#2F7FC4" stroke-width="3.4"/>
+  <circle cx="524" cy="452" r="7" fill="#FFFFFF" stroke="#2F7FC4" stroke-width="3"/>
+  <circle cx="790" cy="300" r="7" fill="#FFFFFF" stroke="#2F7FC4" stroke-width="3"/>
+  <path d="M610 396 L610 372" stroke="#B7CCDF" stroke-width="1.4"/>
+  <rect x="540" y="352" width="140" height="24" rx="7" fill="#FFFFFF" stroke="#CFE0F0" stroke-width="1"/>
+  <text x="552" y="368" font-family="sans-serif" font-size="10" fill="#4A739B">Drive · 723 km · 8h12m</text>
+
+  <text x="884" y="196" font-family="sans-serif" font-size="14" font-weight="700" fill="#16202B">Model tools</text>
+  <rect x="884" y="208" width="340" height="140" rx="14" fill="#FFFFFF" stroke="#CFE0F0" stroke-width="1.4"/>
+  <text x="906" y="236" font-family="sans-serif" font-size="11" fill="#5B7186">travel_project_patch</text>
+  <text x="906" y="260" font-family="sans-serif" font-size="11" fill="#5B7186">travel_place_search</text>
+  <text x="906" y="284" font-family="sans-serif" font-size="11" fill="#5B7186">travel_route_plan</text>
+  <text x="906" y="308" font-family="sans-serif" font-size="11" fill="#5B7186">travel_day_set_transit</text>
+  <text x="906" y="332" font-family="sans-serif" font-size="11" fill="#8FA6BA">13 tools in total</text>
+
+  <text x="884" y="376" font-family="sans-serif" font-size="14" font-weight="700" fill="#16202B">Deterministic alerts</text>
+  <rect x="884" y="388" width="340" height="120" rx="14" fill="#FFFFFF" stroke="#CFE0F0" stroke-width="1.4"/>
+  <circle cx="908" cy="414" r="4" fill="#E0A03C"/>
+  <text x="922" y="418" font-family="sans-serif" font-size="11" fill="#5B7186">Overlaps · overloaded day</text>
+  <circle cx="908" cy="442" r="4" fill="#E0A03C"/>
+  <text x="922" y="446" font-family="sans-serif" font-size="11" fill="#5B7186">Missing or stale routes</text>
+  <circle cx="908" cy="470" r="4" fill="#2F9E6B"/>
+  <text x="922" y="474" font-family="sans-serif" font-size="11" fill="#5B7186">Computed by code, not written by the model</text>
+</svg>

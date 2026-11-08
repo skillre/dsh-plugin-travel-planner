@@ -122,6 +122,15 @@ export interface RouteLeg {
 export interface TransitEnd {
   readonly placeId?: PlaceId
   readonly label: string
+  /**
+   * The end's own coordinate, when it is not a library place.
+   *
+   * A driving day is often only two city names — 「西安 → 成都」 — and the map can
+   * draw that road only once each name has a point. Geocoding the name gives one
+   * without inventing a place to stop at, and keeping it here means the answer
+   * survives a restart instead of being asked for again.
+   */
+  readonly point?: GeoPoint
 }
 
 /**

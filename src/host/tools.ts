@@ -77,6 +77,9 @@ export function registerTravelTools(ctx: Context, deps: TravelToolDeps): void {
             revision: { type: 'number' },
             dayCount: { type: 'number' },
             days: { type: 'array', items: { type: 'string' } },
+            // 新项目会立刻成为当前行程，模型需要知道这一点；既然返回它，
+            // 就必须在 additionalProperties:false 的 schema 里声明，否则整次调用被拒。
+            activeTripId: { type: 'string' },
           },
         },
         render: (_args, value) => [
@@ -176,8 +179,9 @@ export function registerTravelTools(ctx: Context, deps: TravelToolDeps): void {
           }))
         return asJson({
           count: trips.length,
-          activeTripId: selection?.tripId,
-          selectionSource: selection?.source,
+          // 没有选中行程时不能把这些键写成 undefined：工具边界按无损 JSON 校验，
+          // undefined 不是 JSON 值，整次调用会被拒（空工作区正是这种情形）。
+          ...selection === undefined ? {} : { activeTripId: selection.tripId, selectionSource: selection.source },
           trips,
           ...trips.length === 0 ? { hint: '当前工作区还没有旅行项目，请调用 travel_project_create 建立第一个。' } : {},
         })
@@ -500,7 +504,7 @@ export function registerTravelTools(ctx: Context, deps: TravelToolDeps): void {
     defineTool({
       name: 'travel_day_set_transit',
       description:
-        'Record how one day changes city: a transit with its two ends, distance, duration and path. Use it for days that are nothing but driving — a transit day needs no stop and no place, and its ends may be library place ids or plain names. By default the road is planned through AMap (the Web-service API when a key is configured, otherwise the CLI, which answers on a running container) and the distance and duration you pass are ignored; pass plan:false to keep those numbers instead, e.g. the 723 km a day title states.',
+        'Record how one day changes city: a transit with its two ends, distance, duration and path. Use it for days that are nothing but driving — a transit day needs no stop and no place, and its ends may be library place ids or plain names. An end that is only a name is geocoded once when a Web-service key is configured, and that coordinate is written back onto the end. By default the road is planned through AMap (the Web-service API when a key is configured, otherwise the CLI, which answers on a running container) and the distance and duration you pass are ignored; pass plan:false to keep those numbers instead, e.g. the 723 km a day title states.',
       parameters: {
         tripId: { type: 'string', description: '项目 id；省略时使用当前行程（会话选择 → 工作区默认 → 最近更新）。' },
         dayId: { type: 'string', required: true, description: '目标日期 id，例如 d1。' },

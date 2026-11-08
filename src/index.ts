@@ -3,6 +3,7 @@ import { AmapCliError } from './host/amap/cli.js'
 import { createSubprocessExec, delayFrom, type SubprocessLike } from './host/amap/exec.js'
 import { AmapGateway } from './host/amap/gateway.js'
 import { Config as ConfigSchema, normalizeConfig, type Config as TravelPlannerConfig } from './host/config.js'
+import { registerTravelSkill } from './host/skill.js'
 import { registerTravelTools } from './host/tools.js'
 import { TravelService } from './host/travel-service.js'
 import type { TripFs, TripFsTarget } from './host/trip-store.js'
@@ -134,6 +135,9 @@ export function apply(ctx: Context, config: TravelPlannerConfig): void {
     currency: settings.currency,
     timezone: settings.timezone,
   })
+
+  // 插件自带的使用说明随包发布，装上即可用；注册是可选的，失败只 warning。
+  registerTravelSkill(ctx)
 
   const api: TravelPlannerApi = {
     service,

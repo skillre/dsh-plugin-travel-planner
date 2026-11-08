@@ -24,7 +24,10 @@ import {
   routeSteps,
 } from '../src/host/amap/normalize.js'
 import type { GeoPoint } from '../src/domain/trip.js'
-import { drivingRouteOverRest, getPoiByIdOverRest, searchPoisOverRest } from '../src/host/amap/rest.js'
+import type { ExecLike, ExecRequest, ExecResult } from '../src/host/amap/exec.js'
+import { AmapGateway } from '../src/host/amap/gateway.js'
+import type { AmapConfig } from '../src/host/config.js'
+import { drivingRouteOverRest, geocodeAddressOverRest, getPoiByIdOverRest, searchPoisOverRest } from '../src/host/amap/rest.js'
 
 const WEST_LAKE: GeoPoint = { longitude: 120.15507, latitude: 30.274084, coordinateSystem: 'gcj02' }
 
@@ -978,6 +981,69 @@ describe('placeCacheId', () => {
 // Web-service (REST) POI search
 // ---------------------------------------------------------------------------
 
+describe('geocodeAddressOverRest', () => {
+  /** Minimal fetch stand-in that records the requested URL. */
+  function fakeFetch(payload: unknown, status = 200): { readonly impl: typeof fetch; readonly urls: string[] } {
+    const urls: string[] = []
+    const impl = (async (input: string | URL) => {
+      urls.push(String(input))
+      return new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    return { impl, urls }
+  }
+
+  it('reads the coordinate and the provider wording for a city name', async () => {
+    const call = fakeFetch({
+      status: '1',
+      info: 'OK',
+      infocode: '10000',
+      count: '1',
+      geocodes: [{ formatted_address: '陕西省西安市', location: '108.93977,34.341574' }],
+    })
+
+    const found = await geocodeAddressOverRest(
+      { key: 'rest-key', address: '西安' },
+      { fetchImpl: call.impl, minIntervalMs: 0 },
+    )
+
+    expect(found).toEqual({ longitude: 108.93977, latitude: 34.341574, formattedAddress: '陕西省西安市' })
+    expect(call.urls[0]).toContain('/v3/geocode/geo')
+    expect(call.urls[0]).toContain('address=%E8%A5%BF%E5%AE%89')
+  })
+
+  it('narrows the lookup with the city hint when one is given', async () => {
+    const call = fakeFetch({ status: '1', info: 'OK', infocode: '10000', geocodes: [{ location: '104.06,30.67' }] })
+
+    const found = await geocodeAddressOverRest(
+      { key: 'rest-key', address: '东站', city: '成都' },
+      { fetchImpl: call.impl, minIntervalMs: 0 },
+    )
+
+    expect(found).toEqual({ longitude: 104.06, latitude: 30.67 })
+    expect(call.urls[0]).toContain('city=%E6%88%90%E9%83%BD')
+  })
+
+  it('answers with nothing when the provider knows no such name', async () => {
+    const call = fakeFetch({ status: '1', info: 'OK', infocode: '10000', count: '0', geocodes: [] })
+
+    const found = await geocodeAddressOverRest(
+      { key: 'rest-key', address: '不存在的城' },
+      { fetchImpl: call.impl, minIntervalMs: 0 },
+    )
+
+    // A name nobody knows is a day whose road cannot be drawn yet, not an error.
+    expect(found).toBeUndefined()
+  })
+
+  it('reports a rejected key the way the other Web-service calls do', async () => {
+    const call = fakeFetch({ status: '0', info: 'INVALID_USER_KEY', infocode: '10001' })
+
+    await expect(
+      geocodeAddressOverRest({ key: 'bad', address: '西安' }, { fetchImpl: call.impl, minIntervalMs: 0 }),
+    ).rejects.toThrow(/Key 无效或无权限/)
+  })
+})
+
 describe('drivingRouteOverRest', () => {
   /** Minimal fetch stand-in that records the requested URL. */
   function fakeFetch(payload: unknown, status = 200): { readonly impl: typeof fetch; readonly urls: string[] } {
@@ -1128,5 +1194,64 @@ describe('searchPoisOverRest', () => {
     })
     expect(call.urls[0]).toContain('/v3/place/detail')
     expect(call.urls[0]).toContain('id=B0FFKL520U')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Container start gate
+// ---------------------------------------------------------------------------
+
+describe('AmapGateway container start gate', () => {
+  /** AMap settings for these cases: auto-start is on, so only the caller gates it. */
+  function amapConfig(overrides: Partial<AmapConfig> = {}): AmapConfig {
+    return {
+      executable: 'amap-gui',
+      webKeyRef: 'AMAP_WEB_KEY',
+      browserMap: 'off',
+      autoStart: true,
+      autoStop: true,
+      commandTimeoutMs: 5_000,
+      poiCacheTtlMs: 0,
+      routeCacheTtlMs: 0,
+      ...overrides,
+    }
+  }
+
+  /**
+   * A gateway over a fake CLI.
+   *
+   * `status` answers with the container down and `start` answers with it up, so
+   * a case can tell the two apart from the argv alone. The executor is a plain
+   * function: no process, and therefore no desktop window.
+   */
+  function gatewayOverFakeCli(): { readonly gateway: AmapGateway; readonly calls: readonly (readonly string[])[] } {
+    const calls: string[][] = []
+    const exec: ExecLike = async (request: ExecRequest): Promise<ExecResult> => {
+      calls.push([...request.argv])
+      const command = request.argv[request.argv.length - 1]
+      const data = command === 'start' ? { status: 'running', mapReady: true } : { status: 'not_running', mapReady: false }
+      return { exitCode: 0, signal: null, stdout: envelope(data), stderr: '', timedOut: false, aborted: false }
+    }
+    const gateway = new AmapGateway({ exec, env: async () => ({}), cwd: '/workspace', amap: amapConfig() })
+    return { gateway, calls }
+  }
+
+  it('refuses to start a cold container when the caller forbids it', async () => {
+    const fake = gatewayOverFakeCli()
+
+    await expect(fake.gateway.ensureReady(undefined, { allowStart: false })).rejects.toThrow(/容器未运行/)
+
+    // Only `status` was asked. `start` is the one that opens the AMap window,
+    // which is why a batch fill may never reach it on its own.
+    expect(fake.calls.some((argv) => argv.includes('start'))).toBe(false)
+  })
+
+  it('starts a cold container when the caller allows it and the config permits it', async () => {
+    const fake = gatewayOverFakeCli()
+
+    const state = await fake.gateway.ensureReady()
+
+    expect(state.mapReady).toBe(true)
+    expect(fake.calls.map((argv) => argv[argv.length - 1])).toEqual(['status', 'start'])
   })
 })

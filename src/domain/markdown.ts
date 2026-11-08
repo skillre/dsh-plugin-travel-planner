@@ -128,8 +128,22 @@ function renderDay(
     lines.push('', `_区域：${day.areaLabel}_`)
   }
 
+  // A driving day has no stop and is not an empty day: the road is its content,
+  // and a Markdown plan that says 「当天没有安排」 about a 1,077 km drive is wrong.
+  for (const transit of day.transits ?? []) {
+    const figures = [
+      transit.distanceMeters === undefined ? undefined : `${formatKilometers(transit.distanceMeters)} km`,
+      transit.durationSeconds === undefined ? undefined : `${formatMinutes(transit.durationSeconds)} min`,
+    ].filter((part): part is string => part !== undefined)
+    lines.push(
+      '',
+      `- 🚗 **${labelFor(MODE_LABELS, transit.mode)}** ${transit.from.label} → ${transit.to.label}${
+        figures.length === 0 ? '' : ` · ${figures.join(' · ')}`
+      }`,
+    )
+  }
   if (day.items.length === 0) {
-    lines.push('', '_当天没有安排_')
+    if ((day.transits ?? []).length === 0) lines.push('', '_当天没有安排_')
     return lines.join('\n')
   }
 

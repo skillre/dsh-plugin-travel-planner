@@ -368,15 +368,15 @@ function parsePlace(value: unknown): Parsed<TripPlace> {
 }
 
 /** Validate one point literal. */
-function parsePoint(value: unknown): Parsed<GeoPoint> {
-  if (!isRecord(value)) return fail('字段 `point` 必须是对象。')
+function parsePoint(value: unknown, owner = 'point'): Parsed<GeoPoint> {
+  if (!isRecord(value)) return fail(`字段 \`${owner}\` 必须是对象。`)
   const longitude = value['longitude']
   const latitude = value['latitude']
   if (typeof longitude !== 'number' || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
-    return fail('字段 `point.longitude` 必须是 -180..180 之间的有限数字。')
+    return fail(`字段 \`${owner}.longitude\` 必须是 -180..180 之间的有限数字。`)
   }
   if (typeof latitude !== 'number' || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
-    return fail('字段 `point.latitude` 必须是 -90..90 之间的有限数字。')
+    return fail(`字段 \`${owner}.latitude\` 必须是 -90..90 之间的有限数字。`)
   }
   return ok({ longitude, latitude, coordinateSystem: 'gcj02' })
 }
@@ -456,9 +456,13 @@ function parseTransitEnd(value: unknown, field: string): Parsed<TransitEnd> {
   if (placeId.value === undefined && (label.value === undefined || label.value === '')) {
     return fail(`字段 \`${field}\` 需要 placeId 或 label 至少一个。`)
   }
+  // An end that names no place may still carry the coordinate a geocode gave it.
+  const point = value['point'] === undefined ? ok<GeoPoint | undefined>(undefined) : parsePoint(value['point'], `${field}.point`)
+  if (!point.ok) return point
   return ok({
     ...placeId.value === undefined ? {} : { placeId: placeId.value },
     label: label.value?.trim() ?? '',
+    ...point.value === undefined ? {} : { point: point.value },
   })
 }
 
@@ -496,7 +500,7 @@ function parseTransit(value: unknown): Parsed<TripTransit> {
   if (!fetchedAt.ok) return fetchedAt
   const provider = optionalString(value, 'provider')
   if (!provider.ok) return provider
-  const steps = parseSteps(value['steps'])
+  const steps = parseSteps(value['steps'], 'transit')
   if (!steps.ok) return steps
   return ok({
     id: id.value,
@@ -519,14 +523,14 @@ function parseTransit(value: unknown): Parsed<TripTransit> {
 }
 
 /** Validate a leg's steps. */
-function parseSteps(value: unknown): Parsed<readonly RouteStep[]> {
+function parseSteps(value: unknown, owner = 'leg'): Parsed<readonly RouteStep[]> {
   if (value === undefined) return ok([])
-  if (!Array.isArray(value)) return fail('字段 `leg.steps` 必须是数组。')
+  if (!Array.isArray(value)) return fail(`字段 \`${owner}.steps\` 必须是数组。`)
   const steps: RouteStep[] = []
   for (const entry of value) {
-    if (!isRecord(entry)) return fail('每个 `leg.steps` 条目都必须是对象。')
+    if (!isRecord(entry)) return fail(`每个 \`${owner}.steps\` 条目都必须是对象。`)
     const instruction = entry['instruction']
-    if (typeof instruction !== 'string') return fail('`leg.steps[].instruction` 必须是字符串。')
+    if (typeof instruction !== 'string') return fail(`\`${owner}.steps[].instruction\` 必须是字符串。`)
     const distance = typeof entry['distanceMeters'] === 'number' ? entry['distanceMeters'] : 0
     const duration = typeof entry['durationSeconds'] === 'number' ? entry['durationSeconds'] : 0
     steps.push({ instruction, distanceMeters: Math.max(0, distance), durationSeconds: Math.max(0, duration) })

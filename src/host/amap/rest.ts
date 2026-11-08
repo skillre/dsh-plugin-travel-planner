@@ -244,6 +244,54 @@ export async function getPoiByIdOverRest(
   return undefined
 }
 
+/** One coordinate as an address lookup reports it. */
+export interface RestGeocode {
+  readonly longitude: number
+  readonly latitude: number
+  /** The provider's own wording of the address it matched. */
+  readonly formattedAddress?: string
+}
+
+/**
+ * Turn an address or a bare city name into a coordinate.
+ *
+ * A driving day is often only two names — 「西安 → 成都」 — and the map can draw
+ * that road only when each name has a point. Geocoding is the HTTPS answer to
+ * that question: no container, no window, one request. A name the provider does
+ * not know is not an error here; it is simply a day whose road cannot be drawn
+ * yet, so the answer is undefined.
+ *
+ * @param input - key, address text and an optional city hint.
+ * @param options - caller signal, timeout budget and test seams.
+ * @returns the coordinate, or undefined when the provider matched nothing.
+ * @throws {Error} with a user-facing message when the key is rejected or the
+ *   provider answers with an error status.
+ */
+export async function geocodeAddressOverRest(
+  input: { readonly key: string; readonly address: string; readonly city?: string },
+  options: RestCallOptions = {},
+): Promise<RestGeocode | undefined> {
+  const query = new URLSearchParams({ key: input.key, address: input.address })
+  if (input.city !== undefined && input.city !== '') query.set('city', input.city)
+  const payload = await callRest(`/v3/geocode/geo?${query.toString()}`, options)
+  const geocodes = Array.isArray(payload['geocodes'])
+    ? (payload['geocodes'] as readonly Record<string, unknown>[])
+    : []
+  const first = geocodes[0]
+  if (first === undefined) return undefined
+  const location = asText(first['location'])
+  if (location === undefined) return undefined
+  const [longitude, latitude] = location.split(',').map((part) => Number.parseFloat(part))
+  if (longitude === undefined || latitude === undefined) return undefined
+  if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) return undefined
+  const formattedAddress = asText(first['formatted_address'])
+  return {
+    longitude,
+    latitude,
+    ...formattedAddress === undefined ? {} : { formattedAddress },
+  }
+}
+
 /** One driving route as the Web-service API reports it. */
 export interface RestDrivingRoute {
   readonly distanceMeters: number

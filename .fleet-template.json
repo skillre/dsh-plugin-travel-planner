@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "fleetOwner": "skillre",
   "slug": "travel-planner",
-  "templateVersion": "0.4.0",
-  "templateDigest": "sha256:74afdbd42edbb931272bb1642b020161ccb4973832045fd27e117a9db7cbacdc",
-  "policyVersion": "0.4.0",
-  "policyDigest": "sha256:7ecb03e570901b1182fd1d288dad9b722ccdae1ad19d0b1e30ab49c30014eeb2",
+  "templateVersion": "0.5.0",
+  "templateDigest": "sha256:10a9195854782dc1667f48c8754f8ef22a2af4003f21a362f85b4d7a67e91071",
+  "policyVersion": "0.5.0",
+  "policyDigest": "sha256:6711470c7d6f618ff97351e3edffcacd300b3913adfd38a0e4a67e992babd673",
   "createdAt": "2026-09-14",
   "createdWithDsh": "0.1.5-rc.2"
 }

@@ -3,6 +3,18 @@
   "package": "@skillre/dsh-plugin-travel-planner",
   "verified": [
     {
+      "dsh": "0.2.2-rc.1",
+      "verifiedAt": "2026-11-08",
+      "result": "passed",
+      "checks": [
+        "dump-config",
+        "bounded-startup",
+        "web-ui-module-served",
+        "display-metadata"
+      ],
+      "notes": "Isolated DSH_HOME created from the shipped web template; the packed tarball was installed with dsh plugin --profile tpverify add. dump-config composed both rows (skillre-travel-planner with its amap config, and skillre-travel-planner-web). Bounded startup served the Web UI (HTTP 401 without a token, as designed) with zero startup failures. The boot graph advertised plugins/??@skillre/dsh-plugin-travel-planner/client.js&rev=b609500a898f and that URL returned 200 with the module envelope registering id @skillre/dsh-plugin-travel-planner and its sidebarRight registration. The test profile, tarball and processes were removed and the ports verified free. This is module delivery, not a visual/interaction acceptance; the right-sidebar drag feel, photo wall and Desktop Client rendering still need a human check."
+    },
+    {
       "dsh": "0.1.5-rc.2",
       "verifiedAt": "2026-09-15",
       "result": "passed",
@@ -21,7 +33,18 @@
         "bounded-startup",
         "browser"
       ],
-      "notes": "Upgraded line. The right-Sidebar occupant is `active: true` in the live Slot ledger, which is the framework's own signal that the body renders without abdicating (the 0.1.1 failure). The inline AMap map was verified separately: the Web (JS API) key loads from a loopback page origin and renders tiles and a marker (docs/sidebar-v2-design.md 7.1). Isolated-profile `dump-config` and a bounded startup carried the two rows; the 0.1.6 line's guide seat adds `sidebar.right.tab.guide.entry`, which this package does not yet use. For 0.5.0 the timeline and the re-order flow were additionally exercised by a scripted browser run (`.verify/interactive-panel.mjs`) that mounts the shipped bundle with client-side React and drives real pointer events: the drop lands in the intended slot, the preview is held across the Host round-trip, and no preview state survives. The human pass over how the drag feels is still outstanding. For 0.7.0 the container-free photo path was measured against the real account: with an AMap Web-service key the plugin filled 10 of the 11 photo-less places of a live trip over HTTPS (POI id lookups first, keyword search second, calls paced for the key QPS cap), with no CLI invocation and therefore no AMap window."
+      "notes": "Upgraded line. The right-Sidebar occupant is `active: true` in the live Slot ledger, which is the framework's own signal that the body renders without abdicating (the 0.1.1 failure). The inline AMap map was verified separately: the Web (JS API) key loads from a loopback page origin and renders tiles and a marker (docs/sidebar-v2-design.md 7.1). Isolated-profile `dump-config` and a bounded startup carried the two rows; the 0.1.6 line's guide seat adds `sidebar.right.tab.guide.entry`, which this package does not yet use. For 0.5.0 the timeline and the re-order flow were additionally exercised by a scripted browser run (`.verify/interactive-panel.mjs`) that mounts the shipped bundle with client-side React and drives real pointer events: the drop lands in the intended slot, the preview is held across the Host round-trip, and no preview state survives. The human pass over how the drag feels is still outstanding. For 0.7.0 the container-free photo path was measured against the real account: with an AMap Web-service key the plugin filled 10 of the 11 photo-less places of a live trip over HTTPS (POI id lookups first, keyword search second, calls paced for the key QPS cap), with no CLI invocation and therefore no AMap window. For 0.12.0 the driving-day routes were verified in the user's own `web` profile: the 0.12.0 tarball was installed through the profile's plugin manager (reported `restart-required`, the profile dependency now points at skillre-dsh-plugin-travel-planner-0.12.0.tgz), the installed artifacts were read back (the Host bundle carries the `fill-transits` route, the client bundle carries `driveRoutes`/`trv-drive-label`/`routeSpan`/`routeCovers` and exactly one runtime `require(\"react\")`), the whole suite is 316 tests over 6 files, and two scripted real-AMap browser runs (`.verify/drive-routes.mjs`, `.verify/drive-day-mode.mjs`) confirmed the drawn roads and capsules in the whole-trip view and the single-stop driving day. The human pass over the new map lines in a real session is still outstanding."
+    },
+    {
+      "dsh": "0.1.7-alpha.2",
+      "verifiedAt": "2026-09-23",
+      "result": "passed",
+      "checks": [
+        "dump-config",
+        "bounded-startup",
+        "display-metadata"
+      ],
+      "notes": "DSH 升到 0.1.7 线后的重新挂载验证，可复现脚本见舰队根 .verify/mount-alpha2.mjs。全新隔离 DSH_HOME（/tmp/dsh-verify-travel）安装重新打包的 skillre-dsh-plugin-travel-planner-0.12.1.tgz：--dump-config 组合出 skillre-travel-planner 与 skillre-travel-planner-web 两行，有界真实启动通过。本次新增 display-metadata 检查：经 Node ESM resolver 解析已安装副本的 @skillre/dsh-plugin-travel-planner/locale/en.json 与 package.json，确认卡片标题解析为 Travel Planner（修复前会静默退化成裸包名），icon 与 engines.dsh 均可读。包声明 engines.dsh = ^0.1.5-rc.2 || ^0.1.6-alpha.1 || ^0.1.7-alpha.1，全部 13 个主题 token 与当前 theme 对账通过。真实浏览器交互回归（checks 里的 browser）本次未做，仍待补。"
     }
   ]
 }
